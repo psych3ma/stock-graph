@@ -1,0 +1,11 @@
+neo4j>=5.14
+langchain>=0.2
+langchain-community
+langchain-openai
+langchain-neo4j
+openai>=1.0
+fastapi
+uvicorn[standard]
+pydantic-settings
+httpx
+pytest

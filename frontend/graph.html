@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>GraphIQ · 주주 네트워크 탐색</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="graph.css"/>
+</head>
+<body>
+
+<!-- ═════════════════ TOP BAR ═════════════════ -->
+<div class="topbar">
+  <div class="logo">
+    <div class="logo-mark">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+        <circle cx="2.5" cy="2.5" r="1.5" fill="white" opacity=".9"/>
+        <circle cx="10.5" cy="2.5" r="1.5" fill="white" opacity=".9"/>
+        <circle cx="2.5" cy="10.5" r="1.5" fill="white" opacity=".9"/>
+        <circle cx="10.5" cy="10.5" r="1.5" fill="white" opacity=".9"/>
+        <circle cx="6.5" cy="6.5" r="2" fill="white"/>
+        <line x1="2.5" y1="2.5" x2="6.5" y2="6.5" stroke="white" stroke-width=".8" opacity=".5"/>
+        <line x1="10.5" y1="2.5" x2="6.5" y2="6.5" stroke="white" stroke-width=".8" opacity=".5"/>
+        <line x1="2.5" y1="10.5" x2="6.5" y2="6.5" stroke="white" stroke-width=".8" opacity=".5"/>
+        <line x1="10.5" y1="10.5" x2="6.5" y2="6.5" stroke="white" stroke-width=".8" opacity=".5"/>
+      </svg>
+    </div>
+    <span class="logo-name">GraphIQ</span>
+  </div>
+
+  <div class="topbar-sep"></div>
+
+  <div class="search-wrap">
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><circle cx="5.5" cy="5.5" r="4" stroke="currentColor" stroke-width="1.2"/><path d="M9 9l2.5 2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+    <input class="search-input" placeholder="회사명, 주주명 검색..." id="nodeSearch"/>
+  </div>
+
+  <div class="topbar-sep"></div>
+
+  <div class="filter-group">
+    <span class="filter-group-label">필터:</span>
+    <div class="filter-pill active" data-filter="company" onclick="toggleFilter(this)">
+      <div class="filter-dot"></div>
+      <span class="filter-label">회사</span>
+    </div>
+    <div class="filter-pill active" data-filter="person" onclick="toggleFilter(this)">
+      <div class="filter-dot"></div>
+      <span class="filter-label">개인주주</span>
+    </div>
+    <div class="filter-pill active" data-filter="major" onclick="toggleFilter(this)">
+      <div class="filter-dot"></div>
+      <span class="filter-label">최대주주</span>
+    </div>
+    <div class="filter-pill active" data-filter="institution" onclick="toggleFilter(this)">
+      <div class="filter-dot"></div>
+      <span class="filter-label">기관</span>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <div class="status-dot"><span class="sdot" id="statusDot"></span><span id="statusText">초기화 중...</span></div>
+    <div class="topbar-sep"></div>
+    <button class="tb-btn" id="resetViewBtn">
+      <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M2 5.5a3.5 3.5 0 1 1 1 2.45" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M2 8V5.5H4.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      초기화
+    </button>
+  </div>
+</div>
+
+<!-- ═════════════════ MAIN ═════════════════ -->
+<div class="main">
+
+  <!-- GRAPH -->
+  <div class="graph-area" id="graphArea">
+    <div class="graph-loading-overlay hidden" id="graphLoadingOverlay">
+      <div class="graph-loading-spinner"></div>
+      <div class="graph-loading-step" id="graphLoadingStep">데이터 로딩 중...</div>
+      <div class="graph-loading-hint" id="graphLoadingHint">잠시만 기다려 주세요</div>
+    </div>
+    <svg id="graphSvg">
+      <defs>
+        <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L8,3 L0,6 Z" fill="#8b7d6f"/>
+        </marker>
+        <marker id="arrowhead-active" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L8,3 L0,6 Z" fill="#d85604"/>
+        </marker>
+      </defs>
+      <g id="edgeGroup"></g>
+      <g id="nodeGroup"></g>
+    </svg>
+
+    <div class="node-tooltip" id="tooltip"></div>
+
+    <div class="zoom-controls">
+      <button class="zoom-btn" id="zoomIn" title="확대">+</button>
+      <button class="zoom-btn" id="zoomOut" title="축소">−</button>
+      <button class="zoom-btn zoom-btn--icon" id="zoomFit" title="전체보기">⊡</button>
+    </div>
+
+    <div class="graph-legend">
+      <div class="legend-title">노드 유형</div>
+      <div class="legend-row" data-count-type="company">
+        <div class="lc"></div>
+        <span class="legend-label">회사</span>
+        <span class="legend-count" data-count-type="company">0 건</span>
+      </div>
+      <div class="legend-row" data-count-type="person">
+        <div class="lc"></div>
+        <span class="legend-label">개인주주</span>
+        <span class="legend-count" data-count-type="person">0 건</span>
+      </div>
+      <div class="legend-row" data-count-type="major">
+        <div class="lc"></div>
+        <span class="legend-label">최대주주</span>
+        <span class="legend-count" data-count-type="major">0 건</span>
+      </div>
+      <div class="legend-row" data-count-type="institution">
+        <div class="lc"></div>
+        <span class="legend-label">기관</span>
+        <span class="legend-count" data-count-type="institution">0 건</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- RIGHT PANEL -->
+  <div class="side-panel" id="sidePanel">
+    <div class="panel-toggle-btn" id="panelToggle" onclick="togglePanel()">
+      <svg width="8" height="12" viewBox="0 0 8 12" fill="none"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="panel-tabs">
+      <div class="ptab active" data-tab="detail" onclick="switchTab(this)">노드 상세</div>
+      <div class="ptab" data-tab="chat" onclick="switchTab(this)">AI 질문</div>
+    </div>
+    <div id="egoBanner" class="ego-banner util-hidden" role="region" aria-label="지배구조 맵">
+      <span class="ego-banner-label">지배구조 맵 (Ego-Graph)</span>
+      <button type="button" class="ego-exit-btn">전체 그래프로 돌아가기</button>
+    </div>
+
+    <div class="panel-body" id="detailTab">
+      <div class="panel-empty" id="panelEmpty">
+        <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+          <circle cx="14" cy="14" r="6" stroke="#c9bdb2" stroke-width="2"/>
+          <circle cx="34" cy="14" r="6" stroke="#c9bdb2" stroke-width="2"/>
+          <circle cx="14" cy="34" r="6" stroke="#c9bdb2" stroke-width="2"/>
+          <circle cx="34" cy="34" r="6" stroke="#c9bdb2" stroke-width="2"/>
+          <circle cx="24" cy="24" r="7" stroke="#c9bdb2" stroke-width="2"/>
+          <line x1="19" y1="19" x2="14" y2="14" stroke="#c9bdb2" stroke-width="1.5"/>
+          <line x1="29" y1="19" x2="34" y2="14" stroke="#c9bdb2" stroke-width="1.5"/>
+          <line x1="19" y1="29" x2="14" y2="34" stroke="#c9bdb2" stroke-width="1.5"/>
+          <line x1="29" y1="29" x2="34" y2="34" stroke="#c9bdb2" stroke-width="1.5"/>
+        </svg>
+        <p>그래프에서 노드를 클릭하면<br/>상세 정보를 확인할 수 있습니다</p>
+        <span>노드를 드래그하여 그래프를 탐색하세요</span>
+      </div>
+      <div class="node-detail" id="nodeDetail"></div>
+    </div>
+
+    <div class="panel-body chat-section util-hidden" id="chatTab">
+      <div class="chat-context-bar util-hidden" id="ctxBar">
+        <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><circle cx="5.5" cy="5.5" r="4.5" stroke="#d85604" stroke-width="1"/><path d="M5.5 3v3l2 1.5" stroke="#d85604" stroke-width="1" stroke-linecap="round"/></svg>
+        <span class="ctx-label">컨텍스트:</span>
+        <span class="ctx-chip" id="ctxChip"></span>
+        <span class="ctx-clear" onclick="clearContext()">✕</span>
+      </div>
+
+      <div class="chat-msgs" id="chatMsgs">
+        <div id="sugState" class="anim">
+          <div style="font-size:12px;color:var(--text-3);margin-bottom:10px;">
+            노드를 선택하거나 아래 질문을 눌러보세요
+          </div>
+          <div class="suggestions" id="globalSugs">
+            <button class="sug-item" data-q="지분율 50% 이상인 최대주주 목록을 보여줘">지분율 50% 이상 최대주주 목록</button>
+            <button class="sug-item" data-q="국민연금이 5% 이상 보유한 회사는 어디야?">국민연금 5% 이상 보유 회사</button>
+            <button class="sug-item" data-q="2022년 등기임원 평균보수가 가장 높은 회사 TOP 5">임원보수 TOP 5 (2022년)</button>
+            <button class="sug-item" data-q="3개 이상 법인에 투자한 주주를 찾아줘">다중 법인 투자 주주</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="chat-input-area">
+        <div class="chat-input-wrap">
+          <textarea class="chat-textarea" id="chatInput" rows="1" placeholder="이 노드에 대해 질문하세요..."></textarea>
+          <button class="chat-send" id="chatSend">
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 10V3a1 1 0 011-1h7a1 1 0 011 1v5a1 1 0 01-1 1H4L2 10z" stroke="white" stroke-width="1.3" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="graph.js" defer></script>
+</body>
+</html>

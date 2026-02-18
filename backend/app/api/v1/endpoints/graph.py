@@ -1,0 +1,501 @@
+"""
+그래프 시각화용 API 엔드포인트.
+노드/엣지 조회, 노드 상세 정보 제공.
+"""
+import logging
+import re
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+
+from app.core.sanitize import sanitize_text, SEARCH_MAX_LENGTH
+from app.services import graph_service
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/graph", tags=["graph"])
+
+
+_ID_RE = re.compile(r"(\d+)$")
+
+
+def _neo4j_id(node_id: str) -> int:
+    """
+    프론트에서 오는 node_id (예: n123, c123, p456)를 숫자 Neo4j internal id로 변환.
+    """
+    m = _ID_RE.search(node_id)
+    if not m:
+        raise HTTPException(400, "잘못된 node_id 형식입니다.")
+    return int(m.group(1))
+
+
+def _sanitize_search(search: Optional[str]) -> Optional[str]:
+    """검색어 정제 (XSS 방지). 공통 정책: app.core.sanitize."""
+    return sanitize_text(search, max_length=SEARCH_MAX_LENGTH, allow_none=True)
+
+
+@router.get("/nodes")
+def get_nodes(
+    limit: int = Query(50, ge=1, le=500, description="최대 노드 수"),
+    node_type: Optional[str] = Query(None, description="필터: company, person, major, institution"),
+    search: Optional[str] = Query(None, description="검색어 (회사명/주주명)"),
+    node_ids: Optional[str] = Query(None, description="특정 노드 ID들 (쉼표 구분, 엣지 기반 로드용)"),
+):
+    """
+    그래프 노드 목록 조회 (시각화용).
+    
+    성능: limit 기본 50, 최대 500. 초기 로드는 작은 샘플 권장.
+    """
+    graph = graph_service.get_graph()
+
+    nt = (node_type or "").lower().strip() or None
+    sanitized_search = _sanitize_search(search)
+    
+    # node_ids 파라미터 파싱 (엣지 기반 로드용)
+    ids: Optional[list[int]] = None
+    if node_ids:
+        ids = [_neo4j_id(x.strip()) for x in node_ids.split(",") if x.strip()]
+    
+    params = {"limit": limit, "search": sanitized_search} if sanitized_search else {"limit": limit}
+    nodes: list[dict] = []
+
+    try:
+        # node_ids가 제공되면 레이블과 무관하게 모든 노드를 한 번에 조회
+        if ids:
+            # 모든 노드를 ID로 조회 (Company와 Stockholder 모두 포함)
+            q = """
+                MATCH (n)
+                WHERE id(n) IN $ids
+                RETURN id(n) AS id,
+                       labels(n) AS labels,
+                       properties(n) AS props
+            """
+            rows = graph.query(q, params={"ids": ids})
+            
+            for r in rows:
+                labels = r.get("labels") or []
+                props = r.get("props") or {}
+                
+                # Company 노드 처리
+                if "Company" in labels:
+                    if nt in (None, "company"):
+                        nodes.append({
+                            "id": f"n{r['id']}",
+                            "type": "company",
+                            "label": (props.get("companyName") or "Unknown").strip(),
+                            "bizno": props.get("bizno"),
+                            "active": props.get("isActive", True),
+                            "sub": "회사",
+                        })
+                
+                # Stockholder 노드 처리
+                elif "Stockholder" in labels:
+                    shareholder_type = (props.get("shareholderType") or "PERSON").upper()
+                    is_major = "MajorShareholder" in labels
+                    node_t = "major" if is_major else ("institution" if shareholder_type != "PERSON" else "person")
+                    
+                    if nt in (None, "person", "major", "institution"):
+                        if nt and node_t != nt:
+                            continue
+                        
+                        nodes.append({
+                            "id": f"n{r['id']}",
+                            "type": node_t,
+                            "label": (props.get("stockName") or props.get("companyName") or "Unknown").strip(),
+                            "shareholderType": shareholder_type,
+                            "sub": "최대주주" if is_major else ("기관" if shareholder_type != "PERSON" else "개인주주"),
+                        })
+        else:
+            # 기존 로직: node_ids가 없을 때는 레이블별로 조회
+            # 1) Company nodes
+            if nt in (None, "company"):
+                q = """
+                    MATCH (c:Company)
+                    WHERE $search IS NULL OR c.companyName CONTAINS $search
+                    RETURN id(c) AS id,
+                           c.companyName AS label,
+                           c.bizno AS bizno,
+                           coalesce(c.isActive, true) AS active
+                    LIMIT $limit
+                """
+                rows = graph.query(q, params={"limit": limit, "search": search})
+                nodes.extend(
+                    {
+                        "id": f"n{r['id']}",
+                        "type": "company",
+                        "label": (r.get("label") or r.get("companyName") or "Unknown").strip(),
+                        "bizno": r.get("bizno"),
+                        "active": r.get("active", True),
+                        "sub": "회사",
+                    }
+                    for r in rows
+                )
+
+            # 2) Stockholder nodes (Person/Company, plus MajorShareholder label if present)
+            if nt in (None, "person", "major", "institution"):
+                q = """
+                    MATCH (s:Stockholder)
+                    WHERE $search IS NULL OR coalesce(s.stockName, s.companyName, '') CONTAINS $search
+                    RETURN id(s) AS id,
+                           labels(s) AS labels,
+                           coalesce(s.stockName, s.companyName, 'Unknown') AS label,
+                           coalesce(s.shareholderType, 'PERSON') AS shareholderType
+                    LIMIT $limit
+                """
+                rows = graph.query(q, params={"limit": limit, "search": search})
+                for r in rows:
+                    labels = r.get("labels") or []
+                    shareholder_type = (r.get("shareholderType") or "PERSON").upper()
+                    is_major = "MajorShareholder" in labels
+
+                    node_t = "major" if is_major else ("institution" if shareholder_type != "PERSON" else "person")
+                    if nt and node_t != nt:
+                        continue
+
+                    nodes.append(
+                        {
+                            "id": f"n{r['id']}",
+                            "type": node_t,
+                            "label": r.get("label") or "Unknown",
+                            "shareholderType": shareholder_type,
+                            "sub": "최대주주" if is_major else ("기관" if shareholder_type != "PERSON" else "개인주주"),
+                        }
+                    )
+
+        # node_ids가 제공된 경우 limit 제한 없이 모든 요청된 노드 반환
+        if ids:
+            return {"nodes": nodes, "total": len(nodes)}
+        return {"nodes": nodes[:limit], "total": len(nodes)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"노드 조회 실패: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"노드 조회 실패: {str(e)}") from e
+
+
+@router.get("/node-counts")
+def get_node_counts():
+    """
+    노드 타입별 개수 조회 (필터 표시용).
+    성능 최적화: 단일 쿼리로 모든 개수 조회.
+    """
+    graph = graph_service.get_graph()
+    
+    try:
+        # 단일 쿼리로 모든 노드 타입 개수 조회 (성능 최적화)
+        # 주의: shareholderType은 대소문자 구분하므로 toUpper() 사용하여 일관성 유지
+        # 기관 노드: shareholderType이 'CORPORATION' 또는 'INSTITUTION'이거나 Company:Stockholder 레이블을 가진 경우
+        query = """
+        MATCH (c:Company)
+        WHERE NOT 'Stockholder' IN labels(c)
+        WITH count(c) AS company_count
+        MATCH (s:Stockholder)
+        WHERE toUpper(coalesce(s.shareholderType, 'PERSON')) = 'PERSON' 
+          AND NOT 'MajorShareholder' IN labels(s)
+          AND NOT 'Company' IN labels(s)
+        WITH company_count, count(s) AS person_count
+        MATCH (m:MajorShareholder)
+        WITH company_count, person_count, count(m) AS major_count
+        MATCH (i:Stockholder)
+        WHERE (
+            toUpper(coalesce(i.shareholderType, 'PERSON')) IN ['CORPORATION', 'INSTITUTION']
+            OR 'Company' IN labels(i)
+          )
+          AND NOT 'MajorShareholder' IN labels(i)
+        RETURN company_count, person_count, major_count, count(i) AS institution_count
+        """
+        result = graph.query(query)
+        
+        if not result:
+            return {
+                "company": 0,
+                "person": 0,
+                "major": 0,
+                "institution": 0,
+            }
+        
+        row = result[0]
+        return {
+            "company": row.get("company_count", 0),
+            "person": row.get("person_count", 0),
+            "major": row.get("major_count", 0),
+            "institution": row.get("institution_count", 0),
+        }
+    except Exception as e:
+        logger.error(f"노드 개수 조회 실패: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"노드 개수 조회 실패: {str(e)}") from e
+
+
+@router.get("/edges")
+def get_edges(
+    limit: int = Query(100, ge=1, le=1000, description="최대 엣지 수"),
+    node_ids: Optional[str] = Query(None, description="특정 노드 ID들 (쉼표 구분)"),
+    min_ratio: Optional[float] = Query(None, description="최소 지분율(%) — 미만 관계 제외, 시각화 노이즈 감소"),
+):
+    """
+    그래프 엣지(관계) 목록 조회.
+    
+    node_ids 제공 시 해당 노드와 연결된 엣지만 반환 (성능 최적화).
+    min_ratio 제공 시 해당 지분율 미만 관계는 제외 (초기 로딩 시 5 등 권장).
+    """
+    graph = graph_service.get_graph()
+
+    ids: Optional[list[int]] = None
+    if node_ids:
+        ids = [_neo4j_id(x.strip()) for x in node_ids.split(",") if x.strip()]
+
+    # 시각화 노이즈 감소: 지분 N% 미만 관계 제외 (Cypher 가지치기)
+    query = """
+        MATCH (s:Stockholder)-[r:HOLDS_SHARES]->(c:Company)
+        WHERE ($ids IS NULL OR id(s) IN $ids OR id(c) IN $ids)
+          AND ($min_ratio IS NULL OR r.stockRatio >= $min_ratio)
+        WITH r, s, c
+        ORDER BY r.stockRatio DESC
+        LIMIT $limit
+        RETURN id(s) AS fromId,
+               id(c) AS toId,
+               r.stockRatio AS ratio
+    """
+    params = {"limit": limit, "ids": ids, "min_ratio": min_ratio}
+
+    try:
+        rows = graph.query(query, params=params)
+        edges = [
+            {
+                "from": f"n{row['fromId']}",
+                "to": f"n{row['toId']}",
+                "type": "HOLDS_SHARES",
+                "ratio": round(row.get("ratio") or 0, 1),
+                "label": f"{row.get('ratio') or 0:.1f}%",
+            }
+            for row in rows
+        ]
+        return {"edges": edges, "total": len(edges)}
+
+    except Exception as e:
+        logger.error(f"엣지 조회 실패: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"엣지 조회 실패: {str(e)}") from e
+
+
+@router.get("/nodes/{node_id}")
+def get_node_detail(node_id: str):
+    """
+    특정 노드의 상세 정보 + 연결된 노드 목록.
+    """
+    graph = graph_service.get_graph()
+    neo4j_id = _neo4j_id(node_id)
+    
+    # 노드 기본 정보
+    node_query = """
+        MATCH (n)
+        WHERE id(n) = $id
+        RETURN 
+            labels(n) AS labels,
+            properties(n) AS props
+    """
+    
+    # 연결된 노드 (HOLDS_SHARES 관계) — 노드(m)당 한 행만 반환, ratio는 max로
+    related_query = """
+        MATCH (n)-[r:HOLDS_SHARES]-(m)
+        WHERE id(n) = $id
+        WITH m, labels(m) AS labels, properties(m) AS props, max(r.stockRatio) AS ratio
+        RETURN id(m) AS id, labels, props, ratio
+        ORDER BY ratio DESC
+        LIMIT 20
+    """
+    
+    try:
+        node_rows = graph.query(node_query, params={"id": neo4j_id})
+        if not node_rows:
+            raise HTTPException(404, "노드를 찾을 수 없습니다.")
+        
+        node_row = node_rows[0]
+        labels = node_row.get("labels", [])
+        props = node_row.get("props", {})
+        
+        # 노드 타입 판단 (labels + shareholderType)
+        shareholder_type = (props.get("shareholderType") or "PERSON").upper()
+        is_company = "Company" in labels
+        is_major = "MajorShareholder" in labels
+        if is_major:
+            node_type = "major"
+        elif is_company:
+            node_type = "company"
+        else:
+            node_type = "institution" if shareholder_type != "PERSON" else "person"
+        
+        # 연결 노드
+        related_rows = graph.query(related_query, params={"id": neo4j_id})
+        related = [
+            {
+                "id": f"n{r['id']}",
+                "label": r.get("props", {}).get("companyName")
+                or r.get("props", {}).get("stockName", "Unknown"),
+                "type": "company"
+                if "Company" in (r.get("labels") or [])
+                else ("major" if "MajorShareholder" in (r.get("labels") or []) else "person"),
+                "ratio": round(r.get("ratio", 0), 1),
+            }
+            for r in related_rows
+        ]
+        
+        # 통계
+        stats = []
+        if node_type == "company":
+            max_ratio_query = """
+                MATCH (n:Company)<-[r:HOLDS_SHARES]-(s)
+                WHERE id(n) = $id
+                RETURN max(r.stockRatio) AS maxRatio, count(r) AS holderCount
+            """
+            stat_rows = graph.query(max_ratio_query, params={"id": neo4j_id})
+            if stat_rows:
+                max_ratio = stat_rows[0].get("maxRatio") or 0.0
+                holder_count = stat_rows[0].get("holderCount") or 0
+                stats = [
+                    {"val": f"{float(max_ratio):.1f}%", "key": "최대주주 지분율"},
+                    {"val": str(int(holder_count)), "key": "주주 수"},
+                ]
+        else:
+            holdings_query = """
+                MATCH (n)-[r:HOLDS_SHARES]->(c:Company)
+                WHERE id(n) = $id
+                RETURN count(c) AS holdings, avg(r.stockRatio) AS avgRatio
+            """
+            stat_rows = graph.query(holdings_query, params={"id": neo4j_id})
+            if stat_rows:
+                holdings = stat_rows[0].get("holdings") or 0
+                avg_ratio = stat_rows[0].get("avgRatio") or 0.0
+                stats = [
+                    {"val": str(int(holdings)), "key": "투자 종목수"},
+                    {"val": f"{float(avg_ratio):.1f}%", "key": "평균 지분율"},
+                ]
+        
+        return {
+            "id": f"n{neo4j_id}",
+            "type": node_type,
+            "label": props.get("companyName") or props.get("stockName", "Unknown"),
+            "sub": "회사"
+            if node_type == "company"
+            else ("최대주주" if node_type == "major" else ("기관" if node_type == "institution" else "개인주주")),
+            "stats": stats,
+            "props": {k: v for k, v in props.items() if k not in ["nameEmbedding"]},  # 임베딩 제외
+            "related": related,
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"노드 상세 조회 실패 (node_id={node_id}): {str(e)}", exc_info=True)
+        raise HTTPException(500, f"노드 상세 조회 실패: {str(e)}") from e
+
+
+def _row_to_node(r: dict) -> dict:
+    """Neo4j row (id, labels, props) → 시각화용 노드 딕셔너리 (공통)."""
+    labels = r.get("labels") or []
+    props = r.get("props") or {}
+    nid = f"n{r['id']}"
+    if "Company" in labels:
+        return {
+            "id": nid,
+            "type": "company",
+            "label": (props.get("companyName") or "Unknown").strip(),
+            "bizno": props.get("bizno"),
+            "active": props.get("isActive", True),
+            "sub": "회사",
+        }
+    if "Stockholder" in labels:
+        shareholder_type = (props.get("shareholderType") or "PERSON").upper()
+        is_major = "MajorShareholder" in labels
+        node_t = "major" if is_major else ("institution" if shareholder_type != "PERSON" else "person")
+        return {
+            "id": nid,
+            "type": node_t,
+            "label": (props.get("stockName") or props.get("companyName") or "Unknown").strip(),
+            "shareholderType": shareholder_type,
+            "sub": "최대주주" if is_major else ("기관" if shareholder_type != "PERSON" else "개인주주"),
+        }
+    return {"id": nid, "type": "company", "label": "Unknown", "sub": ""}
+
+
+@router.get("/ego")
+def get_ego_graph(
+    node_id: str = Query(..., description="중심 노드 ID (예: n123)"),
+    max_hops: int = Query(2, ge=1, le=3, description="확장 홉 수"),
+    max_nodes: int = Query(120, ge=10, le=300, description="최대 노드 수"),
+):
+    """
+    Ego-Graph: 중심 노드 기준 N홉 이내 노드·엣지만 반환 (지배구조 맵용).
+    Neo4j에서 (Stockholder)-[:HOLDS_SHARES]->(Company) 방향으로 확장.
+    """
+    graph = graph_service.get_graph()
+    neo4j_id = _neo4j_id(node_id)
+
+    # 1) Ego + 양방향 1..max_hops 이내 노드 수집 (중복 제거)
+    if max_hops == 1:
+        rel_pattern = "*1..1"
+    elif max_hops == 2:
+        rel_pattern = "*1..2"
+    else:
+        rel_pattern = "*1..3"
+
+    nodes_query = f"""
+        MATCH (ego)
+        WHERE id(ego) = $id
+        OPTIONAL MATCH (ego)-[r1:HOLDS_SHARES{rel_pattern}]->(n1)
+        OPTIONAL MATCH (ego)<-[r2:HOLDS_SHARES{rel_pattern}]-(n2)
+        WITH ego, n1, n2
+        UNWIND [n1, n2, ego] AS n
+        WITH n WHERE n IS NOT NULL
+        WITH DISTINCT n
+        LIMIT $max_nodes
+        RETURN id(n) AS id, labels(n) AS labels, properties(n) AS props
+    """
+    try:
+        rows = graph.query(nodes_query, params={"id": neo4j_id, "max_nodes": max_nodes})
+    except Exception as e:
+        logger.error(f"Ego 노드 조회 실패: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"Ego 그래프 조회 실패: {str(e)}") from e
+
+    seen = set()
+    nodes = []
+    for r in rows:
+        nid = r.get("id")
+        if nid is None or nid in seen:
+            continue
+        seen.add(nid)
+        nodes.append(_row_to_node(r))
+
+    if not nodes:
+        raise HTTPException(404, "해당 노드를 찾을 수 없거나 연결된 노드가 없습니다.")
+
+    node_ids = [int(x["id"].lstrip("n")) for x in nodes]
+
+    # 2) 위 노드들 사이의 HOLDS_SHARES 엣지만 조회
+    edges_query = """
+        MATCH (a)-[r:HOLDS_SHARES]->(b)
+        WHERE id(a) IN $ids AND id(b) IN $ids
+        RETURN id(a) AS fromId, id(b) AS toId, r.stockRatio AS ratio
+    """
+    try:
+        edge_rows = graph.query(edges_query, params={"ids": node_ids})
+    except Exception as e:
+        logger.error(f"Ego 엣지 조회 실패: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"Ego 그래프 조회 실패: {str(e)}") from e
+
+    edges = [
+        {
+            "from": f"n{row['fromId']}",
+            "to": f"n{row['toId']}",
+            "type": "HOLDS_SHARES",
+            "ratio": round(row.get("ratio") or 0, 1),
+            "label": f"{row.get('ratio') or 0:.1f}%",
+        }
+        for row in edge_rows
+    ]
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "ego_id": f"n{neo4j_id}",
+    }

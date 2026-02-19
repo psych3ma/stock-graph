@@ -1,15 +1,18 @@
 """
 그래프 시각화용 API 엔드포인트.
-노드/엣지 조회, 노드 상세 정보 제공.
+노드/엣지 조회, 노드 상세 정보 제공, NetworkX 기반 레이아웃.
 """
 import logging
 import re
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from neo4j.exceptions import ServiceUnavailable, TransientError, ClientError
 
 from app.core.sanitize import sanitize_text, SEARCH_MAX_LENGTH
+from app.schemas.layout import LayoutRequest, LayoutResponse
 from app.services import graph_service
+from app.services import layout_service
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,17 @@ def _neo4j_id(node_id: str) -> int:
 def _sanitize_search(search: Optional[str]) -> Optional[str]:
     """검색어 정제 (XSS 방지). 공통 정책: app.core.sanitize."""
     return sanitize_text(search, max_length=SEARCH_MAX_LENGTH, allow_none=True)
+
+
+def _clamp_ratio(val) -> float:
+    """지분율(%) 0~100 범위로 제한. 원시 데이터 오류(100% 초과 등)로 인한 표시 버그 방지."""
+    if val is None:
+        return 0.0
+    try:
+        v = float(val)
+        return max(0.0, min(100.0, v))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @router.get("/nodes")
@@ -108,17 +122,45 @@ def get_nodes(
         else:
             # 기존 로직: node_ids가 없을 때는 레이블별로 조회
             # 1) Company nodes
+            # CTO: 텍스트 인덱스 활용 (Neo4j 5.x+), 없으면 CONTAINS로 폴백
             if nt in (None, "company"):
-                q = """
-                    MATCH (c:Company)
-                    WHERE $search IS NULL OR c.companyName CONTAINS $search
-                    RETURN id(c) AS id,
-                           c.companyName AS label,
-                           c.bizno AS bizno,
-                           coalesce(c.isActive, true) AS active
-                    LIMIT $limit
-                """
-                rows = graph.query(q, params={"limit": limit, "search": search})
+                if sanitized_search:
+                    # 텍스트 인덱스 사용 시도 (Neo4j 5.x+)
+                    q = """
+                        CALL db.index.fulltext.queryNodes('company_name_text', $search)
+                        YIELD node, score
+                        WHERE score > 0.5
+                        RETURN id(node) AS id,
+                               node.companyName AS label,
+                               node.bizno AS bizno,
+                               coalesce(node.isActive, true) AS active
+                        LIMIT $limit
+                    """
+                    try:
+                        rows = graph.query(q, params={"limit": limit, "search": sanitized_search})
+                    except ClientError:
+                        # 텍스트 인덱스가 없으면 CONTAINS로 폴백
+                        logger.debug("Text index not available, falling back to CONTAINS")
+                        q = """
+                            MATCH (c:Company)
+                            WHERE c.companyName CONTAINS $search
+                            RETURN id(c) AS id,
+                                   c.companyName AS label,
+                                   c.bizno AS bizno,
+                                   coalesce(c.isActive, true) AS active
+                            LIMIT $limit
+                        """
+                        rows = graph.query(q, params={"limit": limit, "search": sanitized_search})
+                else:
+                    q = """
+                        MATCH (c:Company)
+                        RETURN id(c) AS id,
+                               c.companyName AS label,
+                               c.bizno AS bizno,
+                               coalesce(c.isActive, true) AS active
+                        LIMIT $limit
+                    """
+                    rows = graph.query(q, params={"limit": limit})
                 nodes.extend(
                     {
                         "id": f"n{r['id']}",
@@ -132,17 +174,45 @@ def get_nodes(
                 )
 
             # 2) Stockholder nodes (Person/Company, plus MajorShareholder label if present)
+            # CTO: 텍스트 인덱스 활용, 없으면 CONTAINS로 폴백
             if nt in (None, "person", "major", "institution"):
-                q = """
-                    MATCH (s:Stockholder)
-                    WHERE $search IS NULL OR coalesce(s.stockName, s.companyName, '') CONTAINS $search
-                    RETURN id(s) AS id,
-                           labels(s) AS labels,
-                           coalesce(s.stockName, s.companyName, 'Unknown') AS label,
-                           coalesce(s.shareholderType, 'PERSON') AS shareholderType
-                    LIMIT $limit
-                """
-                rows = graph.query(q, params={"limit": limit, "search": search})
+                if sanitized_search:
+                    # 텍스트 인덱스 사용 시도
+                    q = """
+                        CALL db.index.fulltext.queryNodes('stockholder_name_text', $search)
+                        YIELD node, score
+                        WHERE score > 0.5
+                        RETURN id(node) AS id,
+                               labels(node) AS labels,
+                               coalesce(node.stockName, node.companyName, 'Unknown') AS label,
+                               coalesce(node.shareholderType, 'PERSON') AS shareholderType
+                        LIMIT $limit
+                    """
+                    try:
+                        rows = graph.query(q, params={"limit": limit, "search": sanitized_search})
+                    except ClientError:
+                        # 텍스트 인덱스가 없으면 CONTAINS로 폴백
+                        logger.debug("Text index not available, falling back to CONTAINS")
+                        q = """
+                            MATCH (s:Stockholder)
+                            WHERE coalesce(s.stockName, s.companyName, '') CONTAINS $search
+                            RETURN id(s) AS id,
+                                   labels(s) AS labels,
+                                   coalesce(s.stockName, s.companyName, 'Unknown') AS label,
+                                   coalesce(s.shareholderType, 'PERSON') AS shareholderType
+                            LIMIT $limit
+                        """
+                        rows = graph.query(q, params={"limit": limit, "search": sanitized_search})
+                else:
+                    q = """
+                        MATCH (s:Stockholder)
+                        RETURN id(s) AS id,
+                               labels(s) AS labels,
+                               coalesce(s.stockName, s.companyName, 'Unknown') AS label,
+                               coalesce(s.shareholderType, 'PERSON') AS shareholderType
+                        LIMIT $limit
+                    """
+                    rows = graph.query(q, params={"limit": limit})
                 for r in rows:
                     labels = r.get("labels") or []
                     shareholder_type = (r.get("shareholderType") or "PERSON").upper()
@@ -169,6 +239,18 @@ def get_nodes(
 
     except HTTPException:
         raise
+    except ServiceUnavailable:
+        logger.error("Neo4j 서비스 사용 불가", exc_info=True)
+        raise HTTPException(503, "데이터베이스 서비스 사용 불가. 잠시 후 다시 시도해주세요.")
+    except TransientError:
+        logger.error("Neo4j 일시적 오류", exc_info=True)
+        raise HTTPException(503, "일시적 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+    except ClientError as e:
+        if "Constraint" in str(e) or "constraint" in str(e).lower():
+            logger.warning(f"데이터 제약 조건 위반: {e}")
+            raise HTTPException(400, "데이터 제약 조건 위반")
+        logger.error(f"Neo4j 클라이언트 오류: {e}", exc_info=True)
+        raise HTTPException(400, f"쿼리 오류: {str(e)[:200]}")
     except Exception as e:
         logger.error(f"노드 조회 실패: {str(e)}", exc_info=True)
         raise HTTPException(500, f"노드 조회 실패: {str(e)}") from e
@@ -222,6 +304,15 @@ def get_node_counts():
             "major": row.get("major_count", 0),
             "institution": row.get("institution_count", 0),
         }
+    except ServiceUnavailable:
+        logger.error("Neo4j 서비스 사용 불가", exc_info=True)
+        raise HTTPException(503, "데이터베이스 서비스 사용 불가. 잠시 후 다시 시도해주세요.")
+    except TransientError:
+        logger.error("Neo4j 일시적 오류", exc_info=True)
+        raise HTTPException(503, "일시적 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+    except ClientError as e:
+        logger.error(f"Neo4j 클라이언트 오류: {e}", exc_info=True)
+        raise HTTPException(400, f"쿼리 오류: {str(e)[:200]}")
     except Exception as e:
         logger.error(f"노드 개수 조회 실패: {str(e)}", exc_info=True)
         raise HTTPException(500, f"노드 개수 조회 실패: {str(e)}") from e
@@ -245,37 +336,80 @@ def get_edges(
     if node_ids:
         ids = [_neo4j_id(x.strip()) for x in node_ids.split(",") if x.strip()]
 
-    # 시각화 노이즈 감소: 지분 N% 미만 관계 제외 (Cypher 가지치기)
+    # Neo4j 전문가 관점:
+    # - 동일 (s)->(c) 관계가 reportYear/baseDate 등으로 여러 건 존재할 수 있음
+    # - 프론트에서 합산(sum)하면 100%를 쉽게 초과하므로, 여기서 (from,to) 단위로 집계해 반환
+    # - ratio는 max(r.stockRatio), count는 관계 건수
     query = """
         MATCH (s:Stockholder)-[r:HOLDS_SHARES]->(c:Company)
         WHERE ($ids IS NULL OR id(s) IN $ids OR id(c) IN $ids)
-          AND ($min_ratio IS NULL OR r.stockRatio >= $min_ratio)
-        WITH r, s, c
-        ORDER BY r.stockRatio DESC
+        WITH id(s) AS fromId,
+             id(c) AS toId,
+             max(r.stockRatio) AS ratio,
+             count(r) AS relCount
+        WHERE ($min_ratio IS NULL OR ratio >= $min_ratio)
+        RETURN fromId, toId, ratio, relCount
+        ORDER BY ratio DESC
         LIMIT $limit
-        RETURN id(s) AS fromId,
-               id(c) AS toId,
-               r.stockRatio AS ratio
     """
     params = {"limit": limit, "ids": ids, "min_ratio": min_ratio}
 
     try:
         rows = graph.query(query, params=params)
-        edges = [
-            {
+        edges = []
+        for row in rows:
+            r_val = _clamp_ratio(row.get("ratio"))
+            edges.append({
                 "from": f"n{row['fromId']}",
                 "to": f"n{row['toId']}",
                 "type": "HOLDS_SHARES",
-                "ratio": round(row.get("ratio") or 0, 1),
-                "label": f"{row.get('ratio') or 0:.1f}%",
-            }
-            for row in rows
-        ]
+                "ratio": round(r_val, 1),
+                "count": int(row.get("relCount") or 1),
+                "label": f"{r_val:.1f}%",
+            })
         return {"edges": edges, "total": len(edges)}
 
+    except ServiceUnavailable:
+        logger.error("Neo4j 서비스 사용 불가", exc_info=True)
+        raise HTTPException(503, "데이터베이스 서비스 사용 불가. 잠시 후 다시 시도해주세요.")
+    except TransientError:
+        logger.error("Neo4j 일시적 오류", exc_info=True)
+        raise HTTPException(503, "일시적 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+    except ClientError as e:
+        logger.error(f"Neo4j 클라이언트 오류: {e}", exc_info=True)
+        raise HTTPException(400, f"쿼리 오류: {str(e)[:200]}")
     except Exception as e:
         logger.error(f"엣지 조회 실패: {str(e)}", exc_info=True)
         raise HTTPException(500, f"엣지 조회 실패: {str(e)}") from e
+
+
+@router.post("/layout", response_model=LayoutResponse)
+def post_layout(body: LayoutRequest):
+    """
+    그래프 레이아웃 계산 (협업: ratio → 시각적 거리 1/√ratio 규칙).
+
+    엔진:
+    - networkx: Kamada-Kawai → Spring 2단계 (기본, 항상 사용 가능)
+    - pygraphviz: Graphviz 기반 고품질 레이아웃 (overlap=scale로 라벨 겹침 방지, Graphviz 시스템 라이브러리 필요)
+
+    요청: nodes, edges (프론트와 동일 스키마). 반환 좌표는 0~1 정규화.
+    프론트는 (x * (viewportWidth - 2*pad) + pad, y * (viewportHeight - 2*pad) + pad) 로 스케일.
+    """
+    try:
+        engine = body.engine if body.engine in ("networkx", "pygraphviz") else "networkx"
+        result = layout_service.compute_layout(
+            body.nodes,
+            body.edges,
+            width=body.width,
+            height=body.height,
+            padding=body.padding,
+            use_components=body.use_components,
+            engine=engine,
+        )
+        return LayoutResponse(positions=result["positions"], components=result["components"])
+    except Exception as e:
+        logger.error(f"레이아웃 계산 실패: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"레이아웃 계산 실패: {str(e)}") from e
 
 
 @router.get("/nodes/{node_id}")
@@ -335,7 +469,7 @@ def get_node_detail(node_id: str):
                 "type": "company"
                 if "Company" in (r.get("labels") or [])
                 else ("major" if "MajorShareholder" in (r.get("labels") or []) else "person"),
-                "ratio": round(r.get("ratio", 0), 1),
+                "ratio": round(_clamp_ratio(r.get("ratio")), 1),
             }
             for r in related_rows
         ]
@@ -350,7 +484,7 @@ def get_node_detail(node_id: str):
             """
             stat_rows = graph.query(max_ratio_query, params={"id": neo4j_id})
             if stat_rows:
-                max_ratio = stat_rows[0].get("maxRatio") or 0.0
+                max_ratio = _clamp_ratio(stat_rows[0].get("maxRatio"))
                 holder_count = stat_rows[0].get("holderCount") or 0
                 stats = [
                     {"val": f"{float(max_ratio):.1f}%", "key": "최대주주 지분율"},
@@ -365,7 +499,7 @@ def get_node_detail(node_id: str):
             stat_rows = graph.query(holdings_query, params={"id": neo4j_id})
             if stat_rows:
                 holdings = stat_rows[0].get("holdings") or 0
-                avg_ratio = stat_rows[0].get("avgRatio") or 0.0
+                avg_ratio = _clamp_ratio(stat_rows[0].get("avgRatio"))
                 stats = [
                     {"val": str(int(holdings)), "key": "투자 종목수"},
                     {"val": f"{float(avg_ratio):.1f}%", "key": "평균 지분율"},
@@ -385,6 +519,18 @@ def get_node_detail(node_id: str):
     
     except HTTPException:
         raise
+    except ServiceUnavailable:
+        logger.error("Neo4j 서비스 사용 불가", exc_info=True)
+        raise HTTPException(503, "데이터베이스 서비스 사용 불가. 잠시 후 다시 시도해주세요.")
+    except TransientError:
+        logger.error("Neo4j 일시적 오류", exc_info=True)
+        raise HTTPException(503, "일시적 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+    except ClientError as e:
+        if "Constraint" in str(e) or "constraint" in str(e).lower():
+            logger.warning(f"데이터 제약 조건 위반: {e}")
+            raise HTTPException(400, "데이터 제약 조건 위반")
+        logger.error(f"Neo4j 클라이언트 오류: {e}", exc_info=True)
+        raise HTTPException(400, f"쿼리 오류: {str(e)[:200]}")
     except Exception as e:
         logger.error(f"노드 상세 조회 실패 (node_id={node_id}): {str(e)}", exc_info=True)
         raise HTTPException(500, f"노드 상세 조회 실패: {str(e)}") from e
@@ -432,18 +578,16 @@ def get_ego_graph(
     neo4j_id = _neo4j_id(node_id)
 
     # 1) Ego + 양방향 1..max_hops 이내 노드 수집 (중복 제거)
-    if max_hops == 1:
-        rel_pattern = "*1..1"
-    elif max_hops == 2:
-        rel_pattern = "*1..2"
-    else:
-        rel_pattern = "*1..3"
-
-    nodes_query = f"""
+    # CTO: f-string 제거, 파라미터화된 쿼리 사용 (보안 및 성능)
+    # Neo4j는 관계 패턴 길이를 파라미터로 직접 지원하지 않으므로, 
+    # 안전한 범위 내에서만 허용 (1~3 홉)
+    max_hops_clamped = max(1, min(3, max_hops))
+    
+    nodes_query = """
         MATCH (ego)
         WHERE id(ego) = $id
-        OPTIONAL MATCH (ego)-[r1:HOLDS_SHARES{rel_pattern}]->(n1)
-        OPTIONAL MATCH (ego)<-[r2:HOLDS_SHARES{rel_pattern}]-(n2)
+        OPTIONAL MATCH (ego)-[r1:HOLDS_SHARES*1..$max_hops]->(n1)
+        OPTIONAL MATCH (ego)<-[r2:HOLDS_SHARES*1..$max_hops]-(n2)
         WITH ego, n1, n2
         UNWIND [n1, n2, ego] AS n
         WITH n WHERE n IS NOT NULL
@@ -452,7 +596,10 @@ def get_ego_graph(
         RETURN id(n) AS id, labels(n) AS labels, properties(n) AS props
     """
     try:
-        rows = graph.query(nodes_query, params={"id": neo4j_id, "max_nodes": max_nodes})
+        rows = graph.query(
+            nodes_query, 
+            params={"id": neo4j_id, "max_hops": max_hops_clamped, "max_nodes": max_nodes}
+        )
     except Exception as e:
         logger.error(f"Ego 노드 조회 실패: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Ego 그래프 조회 실패: {str(e)}") from e
@@ -479,20 +626,29 @@ def get_ego_graph(
     """
     try:
         edge_rows = graph.query(edges_query, params={"ids": node_ids})
+    except ServiceUnavailable:
+        logger.error("Neo4j 서비스 사용 불가", exc_info=True)
+        raise HTTPException(503, "데이터베이스 서비스 사용 불가. 잠시 후 다시 시도해주세요.")
+    except TransientError:
+        logger.error("Neo4j 일시적 오류", exc_info=True)
+        raise HTTPException(503, "일시적 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+    except ClientError as e:
+        logger.error(f"Neo4j 클라이언트 오류: {e}", exc_info=True)
+        raise HTTPException(400, f"쿼리 오류: {str(e)[:200]}")
     except Exception as e:
         logger.error(f"Ego 엣지 조회 실패: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Ego 그래프 조회 실패: {str(e)}") from e
 
-    edges = [
-        {
+    edges = []
+    for row in edge_rows:
+        r_val = _clamp_ratio(row.get("ratio"))
+        edges.append({
             "from": f"n{row['fromId']}",
             "to": f"n{row['toId']}",
             "type": "HOLDS_SHARES",
-            "ratio": round(row.get("ratio") or 0, 1),
-            "label": f"{row.get('ratio') or 0:.1f}%",
-        }
-        for row in edge_rows
-    ]
+            "ratio": round(r_val, 1),
+            "label": f"{r_val:.1f}%",
+        })
 
     return {
         "nodes": nodes,

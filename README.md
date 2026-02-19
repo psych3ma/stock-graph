@@ -30,6 +30,7 @@ project-root/
    - API: http://localhost:8000  
    - UI: http://localhost:8501  
    - API Docs: http://localhost:8000/docs  
+   - **그래프 시각화**: `frontend/graph.html` 브라우저에서 열기
 
 3. **로컬 개발**
    ```bash
@@ -37,6 +38,16 @@ project-root/
    make run-be    # 터미널 1
    make run-fe    # 터미널 2
    ```
+
+## 그래프 시각화 아키텍처
+
+**하이브리드 방식**: PyGraphviz (서버 레이아웃 계산) + Vis.js (클라이언트 렌더링)
+
+- **레이아웃**: PyGraphviz neato 엔진으로 결정론적·고품질 레이아웃 (Docker 이미지에 포함)
+- **렌더링**: Vis.js로 부드러운 엣지·라벨 배경·인터랙션 제공 (`physics: false`로 서버 좌표 고정)
+- **폴백**: PyGraphviz 실패 시 NetworkX, 서버 레이아웃 실패 시 클라이언트 force 시뮬레이션
+
+자세한 내용: [`docs/PYGRAPHVIZ-VISJS-HYBRID.md`](docs/PYGRAPHVIZ-VISJS-HYBRID.md) · 다음 단계: [`docs/NEXT-STEPS.md`](docs/NEXT-STEPS.md)
 
 ## 테스트
 
@@ -57,5 +68,18 @@ make test
 
 ## 문서
 
+### 핵심 문서
+- `docs/CHANGELOG.md` — 변경 이력 (시간순)
+- `docs/PYGRAPHVIZ-VISJS-HYBRID.md` — **하이브리드 아키텍처 설계 문서** (PyGraphviz+Vis.js, 서버 계산+클라이언트 렌더링)
+- `docs/NEXT-STEPS.md` — 다음 단계 실행 가이드 (Docker·배포·확인)
+- `docs/ACTION-ITEMS.md` — 설정·액션 아이템 (결정용)
+- `docs/QA-ISSUES-GRAPH-VISUALIZATION.md` — QA 이슈 추적
+- `docs/NETWORKX-EXPERT-REVIEW.md` — NetworkX 레이아웃 검토 + 적용
+- `docs/CTO-LAYOUT-HAIRBALL-FIX.md` — 털뭉치 해소 수정
+
+### 검토 문서
 - `docs/CTO_REVIEW_GraphIQ.md` — CTO 관점 아키텍처·확장성·운영
 - `docs/UX_REVIEW_GraphIQ.md` — UX 검토
+- `docs/QA-BACKEND-FRONTEND-ISSUES.md` — 백엔드/프론트 이슈 리스트
+
+**레거시 문서**: `docs/archive/` 폴더에 보관 (과거 수정 이력)

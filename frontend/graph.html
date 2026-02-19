@@ -4,17 +4,29 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>GraphIQ · 주주 네트워크 탐색</title>
+<!-- CTO: Favicon 추가 (404 에러 방지, 브랜딩 일관성) -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='%23d85604'/><path d='M30 50 L45 35 L45 45 L70 45 L70 55 L45 55 L45 65 Z' fill='white'/></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="graph.css"/>
+<!-- Vis.js for smooth UX (hybrid: PyGraphviz layout + Vis.js rendering) -->
+<link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
+<script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js" defer></script>
+<!-- P2: API Base 주입 (배포 시 환경변수/빌드 시 주입 가능) -->
+<script>
+  // window.GRAPHIQ_API_BASE를 여기서 설정하면 graph.js의 API_BASE가 이를 사용
+  // 예: window.GRAPHIQ_API_BASE = 'https://api.example.com';
+  // 배포 시 환경변수로 주입: <script>window.GRAPHIQ_API_BASE = '{{API_BASE}}';</script>
+</script>
 </head>
 <body>
 
 <!-- ═════════════════ TOP BAR ═════════════════ -->
 <div class="topbar">
-  <div class="logo">
+  <div class="logo" id="logoHome" role="button" aria-label="홈으로 이동" tabindex="0">
+    <!-- CTO: SVG 아이콘 - CSS로 크기 제어 가능하게 변경 -->
     <div class="logo-mark">
-      <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+      <svg class="logo-icon" viewBox="0 0 13 13" fill="none" xmlns="http://www.w3.org/2000/svg">
         <circle cx="2.5" cy="2.5" r="1.5" fill="white" opacity=".9"/>
         <circle cx="10.5" cy="2.5" r="1.5" fill="white" opacity=".9"/>
         <circle cx="2.5" cy="10.5" r="1.5" fill="white" opacity=".9"/>
@@ -33,7 +45,8 @@
 
   <div class="search-wrap">
     <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><circle cx="5.5" cy="5.5" r="4" stroke="currentColor" stroke-width="1.2"/><path d="M9 9l2.5 2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-    <input class="search-input" placeholder="회사명, 주주명 검색..." id="nodeSearch"/>
+    <input class="search-input" placeholder="회사명, 주주명 검색..." id="nodeSearch" autocomplete="off"/>
+    <div class="search-results hidden" id="searchResults"></div>
   </div>
 
   <div class="topbar-sep"></div>
@@ -72,34 +85,67 @@
 <div class="main">
 
   <!-- GRAPH -->
-  <div class="graph-area" id="graphArea">
-    <div class="graph-loading-overlay hidden" id="graphLoadingOverlay">
-      <div class="graph-loading-spinner"></div>
-      <div class="graph-loading-step" id="graphLoadingStep">데이터 로딩 중...</div>
-      <div class="graph-loading-hint" id="graphLoadingHint">잠시만 기다려 주세요</div>
+  <!-- ═══════════════════════════════════════════════════════════════════════════
+       GRAPH AREA (Vis.js 기반, 접근성 강화)
+       CTO: 확장성/유지보수성/일관성/호환성/협업 코드 고려
+       - role="main": 메인 콘텐츠 영역 명시
+       - aria-label: 스크린 리더 지원
+       - data-wheel-bound: 휠 이벤트 바인딩 플래그
+  ═══════════════════════════════════════════════════════════════════════════ -->
+  <div class="graph-area" id="graphArea" role="main" aria-label="그래프 시각화 영역" data-wheel-bound="1">
+    
+    <!-- ═════════════════ LOADING OVERLAY (Unified Variant) ═════════════════ -->
+    <!-- CTO: 단계별 진행률 표시, 프로그레스바, 단계 인디케이터 포함 -->
+    <div class="loading-overlay variant-unified hidden has-progress" id="loadingOverlay" aria-live="polite" aria-busy="false">
+      <div class="loading-spinner"></div>
+      <div class="loading-message-wrap">
+        <div class="loading-text" id="loadingText">UI 구성 중…</div>
+        <div class="loading-guidance" id="loadingGuidance" style="display: none;"></div>
+      </div>
+      <div class="loading-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="로딩 진행률">
+        <div class="loading-bar" id="loadingBar"></div>
+      </div>
+      <div class="loading-steps" id="loadingSteps">
+        <div class="step-item">
+          <div class="step-dot"></div>
+          <span class="step-label">연결</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step-item">
+          <div class="step-dot"></div>
+          <span class="step-label">로딩</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step-item">
+          <div class="step-dot"></div>
+          <span class="step-label">렌더링</span>
+        </div>
+      </div>
     </div>
-    <svg id="graphSvg">
-      <defs>
-        <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-          <path d="M0,0 L8,3 L0,6 Z" fill="#8b7d6f"/>
-        </marker>
-        <marker id="arrowhead-active" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-          <path d="M0,0 L8,3 L0,6 Z" fill="#d85604"/>
-        </marker>
-      </defs>
-      <g id="edgeGroup"></g>
-      <g id="nodeGroup"></g>
-    </svg>
 
-    <div class="node-tooltip" id="tooltip"></div>
+    <!-- ═════════════════ VIS.JS NETWORK CONTAINER ═════════════════ -->
+    <!-- CTO: ID 변경 (visNetworkContainer → visNetwork) -->
+    <div id="visNetwork" aria-label="그래프 네트워크" data-drag-sync-bound="1"></div>
+    
+    <!-- ═════════════════ TOOLTIP ═════════════════ -->
+    <!-- CTO: ID 변경 (tooltip → graphTooltip), role="tooltip" 추가 -->
+    <div id="graphTooltip" role="tooltip" aria-hidden="true"></div>
 
-    <div class="zoom-controls">
+    <!-- ═════════════════ GRAPH STATISTICS ═════════════════ -->
+    <!-- CTO: 새로운 통계 영역 (노드/엣지 수, 필터 상태 등) -->
+    <div class="graph-stats" id="graphStats" aria-label="그래프 통계"></div>
+
+    <!-- ═════════════════ ZOOM CONTROLS ═════════════════ -->
+    <!-- CTO: 접근성 강화 (role="group", aria-label 추가) -->
+    <div class="zoom-controls" role="group" aria-label="줌 컨트롤">
       <button class="zoom-btn" id="zoomIn" title="확대">+</button>
       <button class="zoom-btn" id="zoomOut" title="축소">−</button>
       <button class="zoom-btn zoom-btn--icon" id="zoomFit" title="전체보기">⊡</button>
     </div>
 
-    <div class="graph-legend">
+    <!-- ═════════════════ GRAPH LEGEND ═════════════════ -->
+    <!-- CTO: ID 추가 (id="legend"), 접근성 강화 (role="group", aria-label) -->
+    <div class="graph-legend" id="legend" role="group" aria-label="노드 타입 범례">
       <div class="legend-title">노드 유형</div>
       <div class="legend-row" data-count-type="company">
         <div class="lc"></div>
@@ -187,6 +233,13 @@
             <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 10V3a1 1 0 011-1h7a1 1 0 011 1v5a1 1 0 01-1 1H4L2 10z" stroke="white" stroke-width="1.3" stroke-linejoin="round"/></svg>
           </button>
         </div>
+        <!-- CTO: 대화 초기화 버튼 (컨텍스트 초과 에러 해결을 위한 명확한 UX) -->
+        <button class="chat-reset-btn" id="chatResetBtn" title="대화 이력 초기화">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <path d="M6 2v3l2-2M6 5l-2-2M2 6a4 4 0 1 1 8 0" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          대화 초기화
+        </button>
       </div>
     </div>
   </div>

@@ -1,0 +1,11 @@
+# 선택 사항: PyGraphviz 레이아웃 사용 시에만 설치
+# 설치 전에 시스템에 Graphviz가 있어야 함 (아래 중 하나 실행 후 pip install)
+#
+#   macOS:    brew install graphviz
+#   Ubuntu:   sudo apt-get install graphviz libgraphviz-dev pkg-config
+#   Windows: https://graphviz.org/download/ 에서 설치 후 PATH 설정
+#
+# 그 다음:
+#   pip install -r requirements-pygraphviz.txt
+#
+pygraphviz>=1.11

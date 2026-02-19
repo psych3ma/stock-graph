@@ -1,4 +1,6 @@
 neo4j>=5.14
+networkx>=3.2
+# pygraphviz: 선택 사항. 필요 시 requirements-pygraphviz.txt 참고
 langchain>=0.2
 langchain-community
 langchain-openai

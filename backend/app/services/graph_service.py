@@ -27,7 +27,11 @@ def _get_graph() -> Neo4jGraph:
             url=s.NEO4J_URI,
             username=s.NEO4J_USER,
             password=s.NEO4J_PASSWORD,
-            enhanced_schema=True,
+            # Neo4j 전문가 관점:
+            # - enhanced_schema=True 는 속성/샘플까지 포함해 스키마 토큰이 급증할 수 있음
+            # - GraphCypherQAChain 프롬프트에 {schema}가 그대로 들어가므로, 컨텍스트 초과(400) 원인이 됨
+            # - 도메인 규칙을 프롬프트에 이미 명시하므로 기본 스키마로 충분
+            enhanced_schema=False,
         )
         _graph.refresh_schema()
     return _graph

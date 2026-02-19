@@ -477,10 +477,15 @@ def get_node_detail(node_id: str):
         # 통계
         stats = []
         if node_type == "company":
+            # CTO: 그래프 DB 전문가 관점 - 고유 노드 수 계산
+            # 문제: count(r)는 관계 개수를 세어 중복 관계가 있을 경우 부정확함
+            # 해결: DISTINCT s를 사용하여 고유한 주주 노드만 카운트
+            # 일관성: 연결 노드 계산과 동일한 기준 사용 (WITH m)
             max_ratio_query = """
                 MATCH (n:Company)<-[r:HOLDS_SHARES]-(s)
                 WHERE id(n) = $id
-                RETURN max(r.stockRatio) AS maxRatio, count(r) AS holderCount
+                WITH DISTINCT s, max(r.stockRatio) AS maxRatio
+                RETURN max(maxRatio) AS maxRatio, count(s) AS holderCount
             """
             stat_rows = graph.query(max_ratio_query, params={"id": neo4j_id})
             if stat_rows:
@@ -488,7 +493,7 @@ def get_node_detail(node_id: str):
                 holder_count = stat_rows[0].get("holderCount") or 0
                 stats = [
                     {"val": f"{float(max_ratio):.1f}%", "key": "최대주주 지분율"},
-                    {"val": str(int(holder_count)), "key": "주주 수"},
+                    {"val": str(int(holder_count)), "key": "고유 노드 수"},
                 ]
         else:
             holdings_query = """

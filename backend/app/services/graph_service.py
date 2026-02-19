@@ -1,6 +1,7 @@
 """
 Neo4j 연결, Vector Index, GraphCypherQAChain, ask_graph 통합.
 """
+import logging
 import time
 from typing import Any
 
@@ -11,6 +12,8 @@ from langchain_core.prompts import PromptTemplate
 from neo4j.exceptions import ClientError
 
 from app.core import get_settings
+
+logger = logging.getLogger(__name__)
 
 # ── Lazy 싱글톤 (앱 기동 시 1회 초기화) ─────────────────────────────────────
 _graph: Neo4jGraph | None = None
@@ -80,6 +83,41 @@ def _get_qa_chain():
 4. 금액 단위 만원, 1억=10000, LIMIT 기본 10
 5. Cypher 코드만 반환 — 설명·마크다운 금지
 
+[지분율 변동 쿼리 예시]
+- 시간에 따른 지분율 변동 찾기 (baseDate/reportYear 사용):
+  MATCH (c:Company)<-[r:HOLDS_SHARES]-(s:Stockholder)
+  WHERE c.companyName CONTAINS '회사명'
+  WITH s, c, r ORDER BY r.reportYear ASC, r.baseDate ASC
+  WITH s, c, collect(r.reportYear) AS years, collect(r.stockRatio) AS ratios
+  WHERE size(years) > 1 AND any(i IN range(0, size(ratios)-2) WHERE ratios[i] <> ratios[i+1])
+  RETURN s.stockName AS 주주명, c.companyName AS 회사명, years, ratios
+  ORDER BY years[0] ASC
+  LIMIT 10
+
+- 특정 기간 지분율 변동 (reportYear 사용):
+  MATCH (c:Company)<-[r:HOLDS_SHARES]-(s:Stockholder)
+  WHERE c.companyName CONTAINS '회사명' AND r.reportYear >= 2020
+  WITH s, c, r ORDER BY r.reportYear ASC, r.baseDate ASC
+  WITH s, c, collect(r.reportYear) AS years, collect(r.stockRatio) AS ratios
+  WHERE size(years) > 1 AND any(i IN range(0, size(ratios)-2) WHERE ratios[i] <> ratios[i+1])
+  RETURN s.stockName AS 주주명, c.companyName AS 회사명, years, ratios
+  ORDER BY years[0] ASC
+  LIMIT 10
+
+- 지분율 변동이 있었던 주주 찾기 (여러 회사에 걸쳐):
+  MATCH (c:Company)<-[r:HOLDS_SHARES]-(s:Stockholder)
+  WHERE c.companyName CONTAINS '회사명'
+  WITH s, c, r ORDER BY r.reportYear ASC, r.baseDate ASC
+  WITH s, c, collect(r.reportYear) AS years, collect(r.stockRatio) AS ratios
+  WHERE size(years) > 1 AND any(i IN range(0, size(ratios)-2) WHERE ratios[i] <> ratios[i+1])
+  WITH s, c, years, ratios,
+       min(ratios) AS minRatio, 
+       max(ratios) AS maxRatio
+  RETURN s.stockName AS 주주명, c.companyName AS 회사명, 
+         years, ratios, minRatio, maxRatio
+  ORDER BY abs(maxRatio - minRatio) DESC
+  LIMIT 10
+
 질문: {question}
 
 Cypher:""".strip(),
@@ -97,7 +135,31 @@ DB 결과:
 
 [답변 규칙]
 - 핵심 수치(지분율·금액·건수) 먼저, 금액은 "X억 X천만원" 형식
-- 결과 없으면 "해당 데이터가 없습니다" 안내, 4줄 이내 간결하게
+
+[시계열 데이터 답변 형식]
+- DB 결과에 years, ratios 배열이 있으면:
+  - 형식: "2020년 15%, 2021년 16%" (연도별 지분율)
+  - 시간순으로 정렬하여 표시
+  - 예시:
+    * 입력: years: [2020, 2021], ratios: [15.0, 16.0]
+    * 출력: "2020년 15%, 2021년 16%"
+    * 입력: ratios: [{{year: 2020, ratio: 15.0}}, {{year: 2021, ratio: 16.0}}]
+    * 출력: "2020년 15%, 2021년 16%"
+
+- 추상적인 설명("데이터 중복으로 보입니다") 대신 구체적인 수치 우선 표시
+- 시계열 정보가 있으면 반드시 연도별로 표시
+
+[답변 형식]
+- 시계열 데이터: "x0년 y0%, x1년 y1%" 형식 필수
+- 일반 데이터: 핵심 수치 먼저, 4줄 이내 간결하게
+
+[빈 결과 처리]
+- 결과가 비어있거나 없으면:
+  1. 왜 데이터가 없는지 분석 (쿼리 문제인지, 실제 데이터 부재인지)
+  2. 대안 쿼리나 다른 접근 방법 제시
+  3. 사용자가 원하는 정보를 찾을 수 있는 다른 방법 제안
+  4. 예: "지분율 변동을 찾으려면 baseDate나 reportYear로 시간순 정렬하여 비교해야 합니다. 특정 회사나 기간을 지정해보시겠어요?"
+  5. 가능하면 DB에 있는 실제 데이터를 활용한 대안 제시
 
 답변:""".strip(),
         )

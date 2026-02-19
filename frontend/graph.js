@@ -39,6 +39,22 @@ const API_CONFIG = {
   retryDelay: 1000, // 재시도 지연 (ms)
 };
 
+// CTO: Ego 그래프 설정 상수화 (하드코딩 제거)
+const EGO_GRAPH_CONFIG = {
+  MAX_HOPS: 2,
+  MAX_NODES: 120,
+};
+
+// CTO: 에러 메시지 상수화 (하드코딩 제거, 다국어 지원 준비)
+const ERROR_MESSAGES = {
+  EGO_GRAPH_LOAD_FAILED: "지배구조 맵을 불러올 수 없습니다",
+  EGO_GRAPH_NODE_NOT_FOUND: "해당 노드를 찾을 수 없거나 연결된 노드가 없습니다.",
+  EGO_GRAPH_DATA_MISSING: "지배구조 맵 데이터 없음",
+  EGO_GRAPH_DATA_ERROR: "지배구조 맵 데이터 오류",
+  EGO_GRAPH_NO_NODES: "지배구조 맵 노드 없음",
+  EGO_GRAPH_LOAD_FAILED_STATUS: "지배구조 맵 로드 실패",
+};
+
 // 레이아웃 정책 (협업 문서): ratio(지분%) → 시각적 거리. "높은 지분 = 가까이"로 통일.
 // - 서버(NetworkX): spring_layout weight=ratio. - 클라이언트(force): idealDist ∝ 1/√ratio (useInverseSqrtEdgeLength).
 // Force Simulation — CTO: 초기 배치 + 물리 엔진이 실시간으로 퍼뜨려야 "별자리" 가능. 격자/기본값만 쓰면 4군데 뭉침.
@@ -405,9 +421,12 @@ async function fetchServerLayout(nodes, edges, viewportW, viewportH) {
 }
 
 async function loadEgoGraph(nodeId) {
+  // CTO: nodeId를 상수로 저장하여 catch 블록에서도 사용 가능하도록
+  const targetNodeId = nodeId;
+  
   try {
     isEgoMode = true;
-    egoCenterId = nodeId;
+    egoCenterId = targetNodeId;
     // CTO: UX 개선 - 메시지 일관성 유지
     showGraphLoading(
       LOADING_MESSAGES.loadingEgo,
@@ -416,19 +435,45 @@ async function loadEgoGraph(nodeId) {
       0,
     );
     const res = await apiCall(
-      `/api/v1/graph/ego?node_id=${encodeURIComponent(nodeId)}&max_hops=2&max_nodes=120`,
+      `/api/v1/graph/ego?node_id=${encodeURIComponent(targetNodeId)}&max_hops=${EGO_GRAPH_CONFIG.MAX_HOPS}&max_nodes=${EGO_GRAPH_CONFIG.MAX_NODES}`,
     );
     if (!res || !res.nodes || !res.edges) {
-      updateStatus("Ego 그래프 데이터 없음", false);
+      updateStatus(ERROR_MESSAGES.EGO_GRAPH_DATA_MISSING, false);
       hideGraphLoading();
       isEgoMode = false;
       return;
     }
+    
+    // CTO: ego_id 검증 추가
+    if (!res.ego_id) {
+      console.error("Ego graph response missing ego_id:", res);
+      updateStatus(ERROR_MESSAGES.EGO_GRAPH_DATA_ERROR, false);
+      hideGraphLoading();
+      isEgoMode = false;
+      return;
+    }
+    
     NODES = res.nodes;
     EDGES = res.edges;
     activeFilters = new Set(GRAPH_CONFIG.nodeTypes);
     positions = {};
-    computeHierarchicalLayout(res.ego_id);
+    
+    // CTO: ego_id가 NODES에 존재하는지 확인
+    const egoNode = NODES.find((n) => n.id === res.ego_id);
+    if (!egoNode) {
+      console.warn("Ego node not found in nodes, using first node as fallback:", res.ego_id);
+      // 폴백: 첫 번째 노드를 중심으로 사용
+      if (NODES.length > 0) {
+        computeHierarchicalLayout(NODES[0].id);
+      } else {
+        updateStatus(ERROR_MESSAGES.EGO_GRAPH_NO_NODES, false);
+        hideGraphLoading();
+        isEgoMode = false;
+        return;
+      }
+    } else {
+      computeHierarchicalLayout(res.ego_id);
+    }
     updateStatus("Neo4j 연결됨 (지배구조 맵)", true);
     hideGraphLoading();
     selectedNode = NODES.find((n) => n.id === res.ego_id) || null;
@@ -452,13 +497,26 @@ async function loadEgoGraph(nodeId) {
     egoCenterId = null;
     const banner = document.getElementById("egoBanner");
     if (banner) banner.classList.add("util-hidden");
-    updateStatus("Ego 그래프 로드 실패", false);
+    updateStatus(ERROR_MESSAGES.EGO_GRAPH_LOAD_FAILED_STATUS, false, ERROR_CODES.NEO4J_CONNECTION_FAILED);
     hideGraphLoading();
     console.error("loadEgoGraph failed:", e);
-    if (e.message && e.message.includes("404")) {
-      alert("해당 노드를 찾을 수 없거나 연결된 노드가 없습니다.");
-    } else {
+    
+    // CTO: 에러 타입별 맞춤 처리 (alert 제거, 인라인 메시지로 변경)
+    const errorType = classifyError(e);
+    const errorMessage = e.message || "알 수 없는 오류가 발생했습니다";
+    
+    if (errorType === ERROR_CODES.NETWORK_ERROR || errorType === ERROR_CODES.BACKEND_CONNECTION_FAILED) {
+      // 네트워크/백엔드 연결 오류는 showConnectionError 사용
       showConnectionError(e);
+    } else {
+      // 404 및 기타 에러는 노드 상세 패널에 인라인 메시지 표시
+      showEgoGraphError(
+        errorMessage.includes("404") || errorMessage.includes("찾을 수 없")
+          ? "NOT_FOUND"
+          : "UNKNOWN",
+        errorMessage,
+        targetNodeId,
+      );
     }
   }
 }
@@ -516,10 +574,11 @@ async function loadGraph() {
     );
 
     // 먼저 Backend 프로세스 라이브니스만 확인 (Neo4j 실패와 구분)
+    retryCount = 0; // 재시도 카운터 리셋
     try {
       await apiCall("/ping");
     } catch (e) {
-      updateStatus("Backend 연결 실패 (포트 8000)", false);
+      updateStatus("백엔드 연결 실패", false, ERROR_CODES.BACKEND_CONNECTION_FAILED);
       console.error("Backend ping failed:", e);
       hideGraphLoading();
       showConnectionError(e);
@@ -780,67 +839,218 @@ async function loadGraph() {
   }
 }
 
+// CTO: 에러 분류 시스템
+const ERROR_CODES = {
+  CONTAINER_NOT_FOUND: "CONTAINER_001",
+  BACKEND_CONNECTION_FAILED: "BACKEND_001",
+  NEO4J_CONNECTION_FAILED: "NEO4J_001",
+  NETWORK_ERROR: "NETWORK_001",
+  TIMEOUT: "TIMEOUT_001",
+  SERVICE_UNAVAILABLE: "SERVICE_001",
+  SERVER_ERROR: "SERVER_001",
+  UNKNOWN: "UNKNOWN_001",
+};
+
+// CTO: 자동 재시도 카운터 (전역 변수)
+let retryCount = 0;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_BASE = 3000; // 3초
+
+function classifyError(err) {
+  if (!err) return ERROR_CODES.UNKNOWN;
+  
+  const message = err.message || "";
+  if (message.includes("Failed to fetch") || message.includes("NetworkError")) {
+    return ERROR_CODES.NETWORK_ERROR;
+  }
+  if (message.includes("timeout") || message.includes("Timeout")) {
+    return ERROR_CODES.TIMEOUT;
+  }
+  if (message.includes("503")) {
+    return ERROR_CODES.SERVICE_UNAVAILABLE;
+  }
+  if (message.includes("500")) {
+    return ERROR_CODES.SERVER_ERROR;
+  }
+  return ERROR_CODES.UNKNOWN;
+}
+
+// CTO: 자동 재시도 기능 (최대 3회, 지수 백오프)
+function retryConnection() {
+  retryCount++;
+  if (retryCount > MAX_RETRIES) {
+    retryCount = 0; // 리셋
+    showConnectionError(new Error("최대 재시도 횟수 초과"));
+    return;
+  }
+  
+  // 재시도 중 상태 표시
+  showRetryingState();
+  
+  const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount - 1); // 지수 백오프
+  setTimeout(async () => {
+    try {
+      await apiCall("/ping");
+      // 성공 시 페이지 새로고침
+      location.reload();
+    } catch (e) {
+      // 실패 시 재시도
+      retryConnection();
+    }
+  }, delay);
+}
+
+function showRetryingState() {
+  const graphArea = document.getElementById("graphArea");
+  if (!graphArea) return;
+  graphArea.innerHTML = `
+    <div class="retrying-container">
+      <div class="spinner"></div>
+      <p style="font-size:14px;color:var(--text-2);margin-top:8px;">연결 재시도 중... (${retryCount}/${MAX_RETRIES})</p>
+    </div>
+  `;
+}
+
+function toggleErrorDetails() {
+  const details = document.getElementById("errorDetails");
+  if (details) {
+    details.classList.toggle("hidden");
+  }
+}
+
+// CTO: 에러 메시지 CSS 분리 및 자동 재시도 기능 통합
 function showConnectionError(err) {
   const graphArea = document.getElementById("graphArea");
   if (!graphArea) return;
+  
+  const errorType = classifyError(err);
   const tryUrl = API_BASE + "/ping";
+  
+  const errorMessages = {
+    [ERROR_CODES.NETWORK_ERROR]: "네트워크 연결을 확인해주세요",
+    [ERROR_CODES.TIMEOUT]: "서버 응답 시간이 초과되었습니다",
+    [ERROR_CODES.SERVICE_UNAVAILABLE]: "서비스가 일시적으로 사용할 수 없습니다",
+    [ERROR_CODES.SERVER_ERROR]: "서버 오류가 발생했습니다",
+    [ERROR_CODES.UNKNOWN]: "서버에 연결할 수 없습니다",
+  };
+  
+  const userMessage = errorMessages[errorType] || errorMessages[ERROR_CODES.UNKNOWN];
+  
+  // 로깅
+  console.error("Connection error:", {
+    type: errorType,
+    message: err?.message || "Unknown error",
+    timestamp: new Date().toISOString(),
+  });
+  
   graphArea.innerHTML = `
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:40px;text-align:center;color:var(--text-2);max-width:520px;margin:0 auto;">
-      <div style="font-size:48px;margin-bottom:16px;">⚠️</div>
-      <h2 style="font-size:18px;font-weight:600;color:var(--text-1);margin-bottom:8px;">Backend 서버 연결 실패</h2>
-      <p style="font-size:13px;line-height:1.6;margin-bottom:20px;">
-        연결 시도 주소: <code style="background:var(--surface-2);padding:2px 6px;border-radius:4px;font-size:12px;">${tryUrl}</code>
-      </p>
-      <div style="text-align:left;background:var(--surface-2);padding:16px 20px;border-radius:var(--r);border:1px solid var(--border);margin-bottom:20px;">
-        <p style="font-size:12px;font-weight:600;color:var(--text-1);margin-bottom:10px;">해결 순서 (터미널에서):</p>
-        <p style="font-size:12px;margin:6px 0;"><b>1.</b> 포트 정리 (이전에 실행한 Backend가 있으면) &rarr; <code style="background:var(--surface);padding:2px 6px;">make stop-be</code></p>
-        <p style="font-size:12px;margin:6px 0;"><b>2.</b> Backend 실행 (새 터미널 탭/창에서) &rarr; <code style="background:var(--surface);padding:2px 6px;">make run-be</code></p>
-        <p style="font-size:12px;margin:6px 0;"><b>3.</b> 이 페이지에서 <strong>다시 시도</strong> 또는 새로고침</p>
+    <div class="error-container">
+      <div class="error-icon">⚠️</div>
+      <h2 class="error-title">${userMessage}</h2>
+      <p class="error-message">백엔드 서버가 실행 중인지 확인해주세요.</p>
+      
+      <div class="error-actions">
+        <button class="btn-primary" onclick="retryConnection()">다시 시도</button>
+        <button class="btn-secondary" onclick="toggleErrorDetails()">상세 정보</button>
       </div>
-      <p style="font-size:11px;color:var(--text-3);margin-bottom:8px;">
-        진단: <code style="background:var(--surface-2);padding:2px 4px;">make check-be</code> &nbsp;|&nbsp;
-        수동 확인: <code style="background:var(--surface-2);padding:2px 4px;">curl ${tryUrl}</code>
-      </p>
-      <p style="font-size:11px;color:var(--text-3);margin-bottom:20px;">
-        파일로 열었다면: <code style="background:var(--surface-2);padding:2px 4px;">make serve-graph</code> 실행 후 <code style="background:var(--surface-2);padding:2px 4px;">http://localhost:8080/graph.html</code> 접속
-      </p>
-      <button onclick="location.reload()" style="margin-top:8px;padding:10px 20px;background:var(--pwc-orange);color:#fff;border:none;border-radius:var(--r);cursor:pointer;font-weight:500;">
-        다시 시도
-      </button>
+      
+      <div class="error-details hidden" id="errorDetails">
+        <div class="error-details-content">
+          <p><strong>연결 주소:</strong> <code>${tryUrl}</code></p>
+          <p><strong>에러 타입:</strong> <code>${errorType}</code></p>
+          <p><strong>해결 방법:</strong></p>
+          <ol>
+            <li>터미널에서 <code>make stop-be</code> 실행</li>
+            <li>새 터미널에서 <code>make run-be</code> 실행</li>
+            <li>이 페이지에서 다시 시도</li>
+          </ol>
+          <p style="margin-top:12px;"><strong>진단:</strong></p>
+          <p>진단: <code>make check-be</code> | 수동 확인: <code>curl ${tryUrl}</code></p>
+          <p>파일로 열었다면: <code>make serve-graph</code> 실행 후 <code>http://localhost:8080/graph.html</code> 접속</p>
+        </div>
+      </div>
     </div>
   `;
+  
+  // 에러 코드별 자동 복구 시도
+  if (errorType === ERROR_CODES.BACKEND_CONNECTION_FAILED || errorType === ERROR_CODES.NETWORK_ERROR) {
+    setTimeout(() => {
+      if (retryCount === 0) {
+        retryConnection();
+      }
+    }, 5000); // 5초 후 자동 재시도
+  }
 }
 
+// CTO: CSS 클래스 사용으로 변경
 function showServiceUnavailable() {
   const graphArea = document.getElementById("graphArea");
   if (!graphArea) return;
+  
+  updateStatus("서비스 일시 중단", false, ERROR_CODES.SERVICE_UNAVAILABLE);
+  
   graphArea.innerHTML = `
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:40px;text-align:center;color:var(--text-2);">
-      <div style="font-size:48px;margin-bottom:16px;">⚠️</div>
-      <h2 style="font-size:18px;font-weight:600;color:var(--text-1);margin-bottom:8px;">일시적으로 서비스를 사용할 수 없습니다</h2>
-      <p style="font-size:14px;line-height:1.6;margin-bottom:20px;">
+    <div class="error-container">
+      <div class="error-icon">⚠️</div>
+      <h2 class="error-title">일시적으로 서비스를 사용할 수 없습니다</h2>
+      <p class="error-message">
         Neo4j 또는 API 서버에 일시적 오류가 있을 수 있습니다.<br/>
         .env 의 NEO4J_URI, NEO4J_PASSWORD 를 확인하고 Backend 로그를 확인하세요.
       </p>
-      <button onclick="location.reload()" style="margin-top:20px;padding:8px 16px;background:var(--pwc-orange);color:#fff;border:none;border-radius:var(--r);cursor:pointer;font-weight:500;">
-        다시 시도
-      </button>
+      <div class="error-actions">
+        <button class="btn-primary" onclick="location.reload()">다시 시도</button>
+      </div>
     </div>
   `;
 }
 
+// CTO: CSS 클래스 사용으로 변경
 function showEmptyState() {
   const graphArea = document.getElementById("graphArea");
+  if (!graphArea) return;
   graphArea.innerHTML = `
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:40px;text-align:center;color:var(--text-2);">
-      <div style="font-size:48px;margin-bottom:16px;">📊</div>
-      <h2 style="font-size:18px;font-weight:600;color:var(--text-1);margin-bottom:8px;">데이터가 없습니다</h2>
-      <p style="font-size:14px;line-height:1.6;">
+    <div class="error-container">
+      <div class="error-icon">📊</div>
+      <h2 class="error-title">데이터가 없습니다</h2>
+      <p class="error-message">
         Neo4j 데이터베이스에 노드가 없거나<br/>
         필터 조건에 맞는 데이터가 없습니다.
       </p>
     </div>
   `;
+}
+
+// CTO: Ego 그래프 에러 메시지 렌더링 함수 (하드코딩 제거)
+function renderEgoGraphError(errorType, errorMessage, nodeId) {
+  const errorDetails = {
+    NOT_FOUND: ERROR_MESSAGES.EGO_GRAPH_NODE_NOT_FOUND,
+    UNKNOWN: errorMessage || "알 수 없는 오류가 발생했습니다.",
+  };
+  
+  const detailText = esc(errorDetails[errorType] || errorDetails.UNKNOWN);
+  const safeNodeId = esc(nodeId);
+  
+  return `
+    <div class="error-message-inline">
+      <div class="error-icon-small">⚠️</div>
+      <div class="error-content">
+        <p class="error-title">${esc(ERROR_MESSAGES.EGO_GRAPH_LOAD_FAILED)}</p>
+        <p class="error-detail">${detailText}</p>
+        <button class="btn-retry" data-action="retry-ego-graph" data-node-id="${safeNodeId}">다시 시도</button>
+      </div>
+    </div>
+  `;
+}
+
+// CTO: Ego 그래프 에러 표시 함수 (사이드 이펙트 최소화)
+function showEgoGraphError(errorType, errorMessage, nodeId) {
+  const nodeDetail = document.getElementById("nodeDetail");
+  if (!nodeDetail) return;
+  
+  // CTO: 기존 내용을 완전히 대체 (에러 상태 명확화)
+  nodeDetail.innerHTML = renderEgoGraphError(errorType, errorMessage, nodeId);
+  
+  // CTO: 이벤트 리스너는 전역 이벤트 위임으로 처리 (아래 setupEgoGraphErrorListeners 참조)
 }
 
 async function loadNodeDetail(nodeId) {
@@ -872,9 +1082,20 @@ async function sendChatMessage(question) {
   }
 }
 
-function updateStatus(text, ok) {
+// CTO: 헤더 메시지 간소화 - 20자 이하로 제한, 툴팁으로 전체 메시지 표시
+function updateStatus(text, ok, errorCode = null) {
   const el = document.getElementById("statusText");
-  if (el) el.textContent = text;
+  if (el) {
+    // 긴 메시지는 축약 (20자 이하)
+    const shortText = text.length > 20 ? text.substring(0, 17) + "..." : text;
+    el.textContent = shortText;
+    el.title = text; // 전체 메시지는 툴팁으로
+    if (errorCode) {
+      el.dataset.errorCode = errorCode;
+    } else {
+      delete el.dataset.errorCode;
+    }
+  }
   const dot = document.getElementById("statusDot");
   if (dot) dot.className = ok ? "sdot" : "sdot error";
 }
@@ -1656,8 +1877,9 @@ function renderGraphWithVisJs() {
     });
 
     updateStatus(
-      "그래프 컨테이너를 찾을 수 없습니다 - 페이지를 새로고침해주세요",
+      "컨테이너 오류",
       false,
+      ERROR_CODES.CONTAINER_NOT_FOUND,
     );
 
     // CTO: 사용자에게 명확한 안내
@@ -2197,6 +2419,28 @@ function setupZoomControls() {
     };
   }
 }
+
+// CTO: Ego 그래프 에러 재시도 이벤트 위임 (인라인 이벤트 핸들러 제거)
+document.addEventListener("click", (e) => {
+  if (e.target.classList.contains("btn-retry") && e.target.dataset.action === "retry-ego-graph") {
+    const nodeId = e.target.dataset.nodeId;
+    if (nodeId) {
+      e.preventDefault();
+      loadEgoGraph(nodeId);
+    }
+  }
+});
+
+// CTO: Ego 그래프 에러 재시도 이벤트 위임 (인라인 이벤트 핸들러 제거)
+document.addEventListener("click", (e) => {
+  if (e.target.classList.contains("btn-retry") && e.target.dataset.action === "retry-ego-graph") {
+    const nodeId = e.target.dataset.nodeId;
+    if (nodeId) {
+      e.preventDefault();
+      loadEgoGraph(nodeId);
+    }
+  }
+});
 
 // CTO: 초기화 시 줌 컨트롤 설정 (DOM 로드 후)
 if (document.readyState === "loading") {

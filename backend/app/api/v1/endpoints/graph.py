@@ -583,16 +583,17 @@ def get_ego_graph(
     neo4j_id = _neo4j_id(node_id)
 
     # 1) Ego + 양방향 1..max_hops 이내 노드 수집 (중복 제거)
-    # CTO: f-string 제거, 파라미터화된 쿼리 사용 (보안 및 성능)
-    # Neo4j는 관계 패턴 길이를 파라미터로 직접 지원하지 않으므로, 
-    # 안전한 범위 내에서만 허용 (1~3 홉)
+    # CTO: Neo4j는 관계 패턴 길이를 파라미터로 직접 지원하지 않음
+    # 해결: max_hops 값에 따라 쿼리를 동적으로 생성 (1~3 홉만 허용)
     max_hops_clamped = max(1, min(3, max_hops))
     
-    nodes_query = """
+    # CTO: 관계 패턴 길이는 리터럴 값만 허용되므로 동적 쿼리 생성 필요
+    # 보안: max_hops_clamped는 이미 1~3 범위로 제한되어 있음
+    nodes_query = f"""
         MATCH (ego)
         WHERE id(ego) = $id
-        OPTIONAL MATCH (ego)-[r1:HOLDS_SHARES*1..$max_hops]->(n1)
-        OPTIONAL MATCH (ego)<-[r2:HOLDS_SHARES*1..$max_hops]-(n2)
+        OPTIONAL MATCH (ego)-[r1:HOLDS_SHARES*1..{max_hops_clamped}]->(n1)
+        OPTIONAL MATCH (ego)<-[r2:HOLDS_SHARES*1..{max_hops_clamped}]-(n2)
         WITH ego, n1, n2
         UNWIND [n1, n2, ego] AS n
         WITH n WHERE n IS NOT NULL
@@ -603,7 +604,7 @@ def get_ego_graph(
     try:
         rows = graph.query(
             nodes_query, 
-            params={"id": neo4j_id, "max_hops": max_hops_clamped, "max_nodes": max_nodes}
+            params={"id": neo4j_id, "max_nodes": max_nodes}
         )
     except Exception as e:
         logger.error(f"Ego 노드 조회 실패: {str(e)}", exc_info=True)

@@ -82,6 +82,9 @@ html,
 body {
   height: 100%;
   overflow: hidden;
+  /* CTO: 프론트엔드 전문가 관점 - 뷰포트 크기 변경 대응
+     개발자 도구 열림 등 뷰포트 변경 시에도 레이아웃 유지 */
+  min-width: 0; /* Flex 컨테이너 최소 너비 보장 */
 }
 body {
   font-family: var(--sans);
@@ -419,11 +422,15 @@ textarea {
 }
 
 /* ── MAIN LAYOUT ─────────────────────────── */
+/* CTO: 프론트엔드 전문가 관점 - 메인 레이아웃 반응형 처리
+   문제: 개발자 도구 열림 시 화면이 잘려서 보임
+   해결: 최소 너비 보장 및 flex 축소 허용 */
 .main {
   flex: 1;
   display: flex;
   overflow: hidden;
   position: relative;
+  min-width: 0; /* Flex 컨테이너 최소 너비 보장 (뷰포트 축소 시) */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -436,7 +443,9 @@ textarea {
   position: relative;
   overflow: hidden;
   /* CTO: Flex 리플로우 시 폭 계산 안정 (협업: CTO_LAYOUT_WIDTH_ANALYSIS) */
-  min-width: 0;
+  /* CTO: 프론트엔드 전문가 관점 - 최소 너비 보장 (개발자 도구 열림 시에도 그래프 영역 유지)
+     min-width: 0은 Flex 축소 허용, 300px은 최소 너비 보장 */
+  min-width: 300px; /* 최소 너비 보장 (뷰포트 축소 시에도 그래프 영역 최소 크기 유지) */
   /* CTO: 그래프와 마우스/터치/스크롤 싱크 - 터치 시 문서 스크롤 방지, 줌/팬만 그래프에 적용 */
   touch-action: none;
   user-select: none;
@@ -1091,8 +1100,22 @@ textarea {
 
 /* ═══════════════════════════════════════════════════════════════════════════
    반응형 디자인
-   CTO: 호환성 - 모바일 환경 지원
+   CTO: 호환성 - 모바일 환경 및 개발자 도구 열림 시 대응
    ═══════════════════════════════════════════════════════════════════════════ */
+/* CTO: 프론트엔드 전문가 관점 - 중간 크기 뷰포트 대응 (개발자 도구 열림 시나리오)
+   개발자 도구는 보통 400-600px 정도의 너비를 차지하므로, 1200px 이하에서 대응 */
+@media (max-width: 1200px) {
+  /* 사이드 패널 축소 허용 및 최소 너비 조정 */
+  .side-panel {
+    min-width: 240px; /* 중간 크기 뷰포트에서 최소 너비 축소 */
+  }
+  
+  /* 그래프 영역 최소 너비 조정 */
+  .graph-area {
+    min-width: 250px; /* 중간 크기 뷰포트에서 최소 너비 축소 */
+  }
+}
+
 @media (max-width: 768px) {
   .loading-overlay {
     padding: 20px;
@@ -1116,6 +1139,14 @@ textarea {
   }
   .loading-overlay.variant-unified .step-label {
     font-size: 10px;
+  }
+  
+  /* CTO: 모바일 환경에서 사이드 패널 및 그래프 영역 최소 너비 조정 */
+  .side-panel {
+    min-width: 200px; /* 모바일에서 최소 너비 더 축소 */
+  }
+  .graph-area {
+    min-width: 200px; /* 모바일에서 최소 너비 더 축소 */
   }
 }
 
@@ -1335,9 +1366,13 @@ textarea {
 }
 
 /* ── RIGHT PANEL ─────────────────────────── */
+/* CTO: 프론트엔드 전문가 관점 - 사이드 패널 반응형 처리
+   문제: 개발자 도구 열림 시 화면이 잘려서 보임
+   해결: 작은 뷰포트에서 사이드 패널 축소 허용 및 최소 너비 보장 */
 .side-panel {
   width: var(--panel-w);
-  flex-shrink: 0;
+  flex-shrink: 1; /* CTO: 뷰포트 축소 시 사이드 패널도 축소 허용 (0 → 1) */
+  min-width: 280px; /* CTO: 최소 너비 보장 (너무 작아지지 않도록) */
   background: var(--surface);
   border-left: 1px solid var(--border);
   display: flex;
@@ -2033,4 +2068,183 @@ textarea {
 }
 .anim {
   animation: fadeUp 0.25s ease both;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ERROR MESSAGES (CTO: 에러 메시지 CSS 분리 - 유지보수성 향상)
+   ═══════════════════════════════════════════════════════════════════════════ */
+.error-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 40px;
+  text-align: center;
+  color: var(--text-2);
+  max-width: 520px;
+  margin: 0 auto;
+}
+.error-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+.error-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-1);
+  margin-bottom: 8px;
+}
+.error-message {
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 20px;
+}
+.error-actions {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.error-details {
+  width: 100%;
+  text-align: left;
+  background: var(--surface-2);
+  padding: 16px 20px;
+  border-radius: var(--r);
+  border: 1px solid var(--border);
+  margin-bottom: 20px;
+}
+.error-details.hidden {
+  display: none;
+}
+.error-details-content {
+  font-size: 12px;
+}
+.error-details-content p {
+  margin: 6px 0;
+}
+.error-details-content ol {
+  margin: 8px 0;
+  padding-left: 20px;
+}
+.error-details-content code {
+  background: var(--surface);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+.error-details-content code:only-child {
+  padding: 2px 4px;
+}
+.btn-primary {
+  padding: 10px 20px;
+  background: var(--pwc-orange);
+  color: #fff;
+  border: none;
+  border-radius: var(--r);
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 14px;
+  transition: all 0.15s;
+}
+.btn-primary:hover {
+  background: #c24d03;
+}
+.btn-secondary {
+  padding: 10px 20px;
+  background: var(--surface);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 14px;
+  transition: all 0.15s;
+}
+.btn-secondary:hover {
+  background: var(--surface-2);
+  border-color: var(--border-2);
+}
+.retrying-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 40px;
+  text-align: center;
+  color: var(--text-2);
+}
+.retrying-container .spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--border);
+  border-top-color: var(--pwc-orange);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin-bottom: 16px;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.error-diagnostic {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-bottom: 8px;
+}
+.error-diagnostic code {
+  background: var(--surface-2);
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   INLINE ERROR MESSAGES (CTO: 지배구조 맵 에러 처리 개선)
+   ═══════════════════════════════════════════════════════════════════════════ */
+.error-message-inline {
+  display: flex;
+  gap: 12px;
+  padding: 16px;
+  background: var(--surface-error);
+  border: 1px solid var(--border-error);
+  border-radius: var(--r);
+  margin: 16px;
+}
+.error-icon-small {
+  font-size: 24px;
+  flex-shrink: 0;
+}
+.error-content {
+  flex: 1;
+}
+.error-content .error-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1);
+  margin-bottom: 6px;
+}
+.error-content .error-detail {
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+.btn-retry {
+  padding: 8px 16px;
+  background: var(--pwc-orange);
+  color: #fff;
+  border: none;
+  border-radius: var(--r);
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 13px;
+  transition: all 0.15s;
+}
+.btn-retry:hover {
+  background: #c24d03;
 }

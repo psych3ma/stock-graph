@@ -60,7 +60,7 @@ with col1:
         st.info("💡 주주, 지분율, 임원보수 등을 자연어로 질문해 보세요. 왼쪽 예시를 눌러 시작할 수 있습니다.")
 with col2:
     # st.markdown("### 🎨 [그래프 시각화 UI →](http://localhost:8080/graph.html)")
-    render_url = st.secrets.get("GRAPHIQ_API_URL", "https://stock-graph-y8v7.onrender.com")
+    render_url = st.secrets.get("GRAPHIQ_API_URL", "https://fnco-graph-y8v7.onrender.com")
     st.markdown(f"### 🎨 [그래프 시각화 UI →]({render_url}/static/graph.html)")
 
 st.divider()

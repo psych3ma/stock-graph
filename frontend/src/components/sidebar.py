@@ -14,7 +14,7 @@ EXAMPLE_QUESTIONS = [
 
 def render_sidebar(on_example_click=None, on_reset_click=None):
     with st.sidebar:
-        st.markdown("## 🔗 GraphIQ")
+        st.markdown("## 🔗 금융회사지배구조")
         st.caption("주주 네트워크 자연어 질의 서비스")
         st.divider()
 

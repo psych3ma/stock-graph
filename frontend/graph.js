@@ -379,12 +379,34 @@ async function apiCall(endpoint, options = {}) {
   }
 }
 
+// CTO: “전체 그래프로 돌아가기” — 로고 클릭(ego 시)과 동일한 완료 동작으로 사이드이펙트 방지
 function exitEgoMode() {
   isEgoMode = false;
   egoCenterId = null;
   const banner = document.getElementById("egoBanner");
   if (banner) banner.classList.add("util-hidden");
-  loadGraph();
+  selectedNode = null;
+  selectedNodeId = null;
+  connectedNodeIds.clear();
+  loadGraph().then(() => {
+    if (visNetwork) {
+      visNetwork.unselectAll();
+      let fitDone = false;
+      const doFit = () => {
+        if (fitDone || !visNetwork) return;
+        fitDone = true;
+        try {
+          visNetwork.fit({ animation: { duration: 300 } });
+        } catch (e) {
+          console.warn("exitEgoMode fit failed:", e);
+        }
+      };
+      visNetwork.once("stabilizationIterationsDone", doFit);
+      setTimeout(doFit, 550);
+    }
+    showEmptyPanel();
+    updateStatus("전체 그래프로 돌아갔습니다", true);
+  });
 }
 
 /** NetworkX 레이아웃 API 호출. 0~1 정규화 좌표를 뷰포트 픽셀로 스케일. 협업: ratio → 시각적 거리 규칙은 백엔드와 동일. */
@@ -477,6 +499,7 @@ async function loadEgoGraph(nodeId) {
     updateStatus("Neo4j 연결됨 (지배구조 맵)", true);
     hideGraphLoading();
     selectedNode = NODES.find((n) => n.id === res.ego_id) || null;
+    selectedNodeId = res.ego_id; // CTO: 상태 일관성 — 포커스/렌더링과 동기화
     if (selectedNode) {
       const detail = await loadNodeDetail(selectedNode.id);
       if (detail) renderNodeDetail(detail);
@@ -489,8 +512,12 @@ async function loadEgoGraph(nodeId) {
       if (btn) btn.onclick = exitEgoMode;
     }
     renderGraph();
-    if (visNetwork) {
-      setTimeout(() => visNetwork.fit({ animation: { duration: 300 } }), 100);
+    // CTO: ego 중심 노드로 뷰 포커스 (fit만 하면 구석으로 밀리는 이슈 방지)
+    if (visNetwork && res.ego_id) {
+      const centerId = res.ego_id;
+      requestAnimationFrame(() => {
+        setTimeout(() => focusOnNode(centerId), 150);
+      });
     }
   } catch (e) {
     isEgoMode = false;
@@ -1753,25 +1780,10 @@ function setupVisNetworkEvents(network) {
         selectNode(node);
 
         // CTO: 그래프 재렌더링으로 dimming 효과 적용 (먼저 렌더링)
-        // 주의: 노드 선택 시에는 physics 재활성화하지 않음 (줌 상태 유지)
         renderGraph();
 
-        // CTO: 네트워크 중심 뷰 - 선택된 노드로 자동 줌/패닝 (렌더링 후 실행)
-        // renderGraph() 내부에서 visNetwork가 업데이트되므로, 그 이후에 focus 호출
-        // CTO: focus 호출 후 줌 상태가 변경되므로, 수동 휠 핸들러가 제대로 작동하도록 보장
-        setTimeout(() => {
-          if (visNetwork) {
-            visNetwork.focus(nodeId, {
-              scale: 1.5, // 약간 확대
-              animation: {
-                duration: 400,
-                easingFunction: "easeInOutQuad",
-              },
-            });
-            // focus 후 줌 핸들러가 제대로 작동하도록 보장
-            // (이미 _wheelHandlerAdded 플래그로 중복 방지됨)
-          }
-        }, 50); // 렌더링 완료 대기
+        // CTO: 선택 노드로 뷰 포커스 (공통 focusOnNode로 일관된 줌/패닝)
+        focusOnNode(nodeId);
       }
     } else {
       // 빈 공간 클릭 시 선택 해제
@@ -2406,9 +2418,17 @@ function setupZoomControls() {
 
   if (resetViewBtn) {
     resetViewBtn.onclick = () => {
+      // CTO: ego 모드면 로고 클릭과 동일하게 전체 그래프로 복귀 (일관된 “초기화” 동작)
+      if (isEgoMode) {
+        resetToHome();
+        return;
+      }
       selectedNode = null;
+      selectedNodeId = null;
+      connectedNodeIds.clear();
       if (visNetwork) {
         try {
+          visNetwork.unselectAll();
           visNetwork.fit({ animation: { duration: 300 } });
         } catch (e) {
           console.warn("Reset view failed:", e);
@@ -2475,6 +2495,30 @@ function hideTooltip() {
     tooltip.classList.remove("visible");
     tooltip.style.opacity = "0";
   }
+}
+
+// CTO: 노드 포커스(줌/패닝) 공통 로직 — 노드 클릭·검색 선택 시 재사용 (유지보수성·일관성)
+function focusOnNode(nodeId) {
+  if (!visNetwork || !nodeId) return;
+  const run = () => {
+    if (!visNetwork) return;
+    try {
+      visNetwork.focus(nodeId, {
+        scale: 1.2,
+        animation: {
+          duration: 400,
+          easingFunction: "easeInOutQuad",
+        },
+      });
+    } catch (e) {
+      console.warn("focusOnNode failed:", e);
+    }
+  };
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      setTimeout(run, 80);
+    });
+  });
 }
 
 async function selectNode(n) {
@@ -2818,6 +2862,20 @@ function showEmptyPanel() {
 /* ═══════════════════════════════════════════
    CHAT
 ═══════════════════════════════════════════ */
+// UX: AI 질문 탭 기본 프롬프트/제안 (노드 미선택 시) — 일관성·유지보수용 단일 소스
+const CHAT_DEFAULT_PLACEHOLDER = "자연어로 질문하세요 (예: 지분율 50% 이상 최대주주)";
+const CHAT_DEFAULT_SUG_HTML = `
+  <div style="font-size:12px;color:var(--text-3);margin-bottom:10px;">
+    노드를 선택하거나 아래 질문을 눌러보세요
+  </div>
+  <div class="suggestions" id="globalSugs">
+    <button class="sug-item" data-q="지분율 50% 이상인 최대주주 목록을 보여줘">지분율 50% 이상 최대주주 목록</button>
+    <button class="sug-item" data-q="국민연금이 5% 이상 보유한 회사는 어디야?">국민연금 5% 이상 보유 회사</button>
+    <button class="sug-item" data-q="2022년 등기임원 평균보수가 가장 높은 회사 TOP 5">임원보수 TOP 5 (2022년)</button>
+    <button class="sug-item" data-q="3개 이상 법인에 투자한 주주를 찾아줘">다중 법인 투자 주주</button>
+  </div>
+`;
+
 const CONTEXT_SUGGESTIONS = {
   company: (n) => [
     `${n.label}의 최대주주는 누구야?`,
@@ -2841,34 +2899,51 @@ const CONTEXT_SUGGESTIONS = {
   ],
 };
 
-function openChatWithContext(nodeId, label, type) {
-  switchTabById("chat");
-  chatContext = { nodeId, label, type };
-  document.getElementById("ctxBar").classList.remove("util-hidden");
-  document.getElementById("ctxChip").textContent = label;
-  document.getElementById("chatInput").placeholder =
-    `"${label}"에 대해 질문하세요...`;
-
-  const sugs = CONTEXT_SUGGESTIONS[type]?.({ label }) || [];
+// UX: AI 질문 탭 UI를 chatContext와 동기화 — 탭 전환/노드 변경 시 일관된 화면
+function syncChatTabUI() {
+  const ctxBar = document.getElementById("ctxBar");
+  const ctxChip = document.getElementById("ctxChip");
+  const chatInput = document.getElementById("chatInput");
   const sugState = document.getElementById("sugState");
+  if (!ctxBar || !chatInput) return;
+
+  if (!chatContext) {
+    ctxBar.classList.add("util-hidden");
+    chatInput.placeholder = CHAT_DEFAULT_PLACEHOLDER;
+    if (sugState) {
+      sugState.innerHTML = CHAT_DEFAULT_SUG_HTML;
+      sugState.style.display = "";
+      bindSugButtons(sugState);
+    }
+    return;
+  }
+  ctxBar.classList.remove("util-hidden");
+  if (ctxChip) ctxChip.textContent = chatContext.label;
+  chatInput.placeholder = `"${chatContext.label}"에 대해 질문하세요...`;
+  const sugs = CONTEXT_SUGGESTIONS[chatContext.type]?.({ label: chatContext.label }) || [];
   if (sugState) {
     sugState.innerHTML = `
       <div style="font-size:12px;color:var(--text-3);margin-bottom:8px;">
-        <strong style="color:var(--pwc-orange)">${esc(label)}</strong>에 대해 물어볼 수 있어요
+        <strong style="color:var(--pwc-orange)">${esc(chatContext.label)}</strong>에 대해 물어볼 수 있어요
       </div>
       <div class="suggestions">
         ${sugs.map((q) => `<button class="sug-item" data-q="${esc(q)}">${esc(q)}</button>`).join("")}
       </div>
     `;
+    sugState.style.display = "";
     bindSugButtons(sugState);
   }
 }
 
+function openChatWithContext(nodeId, label, type) {
+  switchTabById("chat");
+  chatContext = { nodeId, label, type };
+  syncChatTabUI();
+}
+
 function clearContext() {
   chatContext = null;
-  document.getElementById("ctxBar").classList.add("util-hidden");
-  document.getElementById("chatInput").placeholder =
-    "이 노드에 대해 질문하세요...";
+  syncChatTabUI();
 }
 
 // CTO: 대화 이력 초기화 (컨텍스트 초과 에러 해결을 위한 명확한 UX)
@@ -2886,34 +2961,25 @@ async function resetChatHistory() {
       method: "DELETE",
     });
 
-    // 채팅 메시지 영역 초기화
     const msgs = document.getElementById("chatMsgs");
     if (msgs) {
       const sugState = document.getElementById("sugState");
       if (sugState) {
         msgs.innerHTML = "";
-        msgs.appendChild(sugState);
-        sugState.style.display = "";
+        const wrap = document.createElement("div");
+        wrap.id = "sugState";
+        wrap.className = "anim";
+        wrap.innerHTML = CHAT_DEFAULT_SUG_HTML;
+        msgs.appendChild(wrap);
+        bindSugButtons(wrap);
       } else {
-        msgs.innerHTML = `
-          <div id="sugState" class="anim">
-            <div style="font-size:12px;color:var(--text-3);margin-bottom:10px;">
-              노드를 선택하거나 아래 질문을 눌러보세요
-            </div>
-            <div class="suggestions" id="globalSugs">
-              <button class="sug-item" data-q="지분율 50% 이상인 최대주주 목록을 보여줘">지분율 50% 이상 최대주주 목록</button>
-              <button class="sug-item" data-q="국민연금이 5% 이상 보유한 회사는 어디야?">국민연금 5% 이상 보유 회사</button>
-              <button class="sug-item" data-q="2022년 등기임원 평균보수가 가장 높은 회사 TOP 5">임원보수 TOP 5 (2022년)</button>
-              <button class="sug-item" data-q="3개 이상 법인에 투자한 주주를 찾아줘">다중 법인 투자 주주</button>
-            </div>
-          </div>
-        `;
+        msgs.innerHTML = `<div id="sugState" class="anim">${CHAT_DEFAULT_SUG_HTML}</div>`;
         bindSugButtons(msgs);
       }
     }
 
-    // 컨텍스트도 초기화
-    clearContext();
+    chatContext = null;
+    syncChatTabUI();
 
     // 사용자 피드백
     updateStatus("대화 이력이 초기화되었습니다", true);
@@ -3085,21 +3151,19 @@ document.getElementById("chatInput").addEventListener("input", function () {
    TABS & PANEL TOGGLE
 ═══════════════════════════════════════════ */
 function switchTab(el) {
-  document
-    .querySelectorAll(".ptab")
-    .forEach((t) => t.classList.remove("active"));
-  el.classList.add("active");
   const tab = el.dataset.tab;
+  document.querySelectorAll(".ptab").forEach((t) => {
+    t.classList.toggle("active", t === el);
+    t.setAttribute("aria-selected", t === el ? "true" : "false");
+  });
   const detailTab = document.getElementById("detailTab");
   const chatTab = document.getElementById("chatTab");
-
-  if (tab === "detail") {
-    detailTab.classList.remove("util-hidden");
-    chatTab.classList.add("util-hidden");
-  } else {
-    detailTab.classList.add("util-hidden");
-    chatTab.classList.remove("util-hidden");
-  }
+  const showDetail = tab === "detail";
+  detailTab.classList.toggle("util-hidden", !showDetail);
+  chatTab.classList.toggle("util-hidden", showDetail);
+  if (detailTab) detailTab.setAttribute("aria-hidden", showDetail ? "false" : "true");
+  if (chatTab) chatTab.setAttribute("aria-hidden", showDetail ? "true" : "false");
+  if (tab === "chat") syncChatTabUI(); // UX: AI 질문 탭 진입 시 컨텍스트와 UI 동기화
 }
 function switchTabById(id) {
   const el = document.querySelector(`.ptab[data-tab="${id}"]`);
@@ -3243,16 +3307,12 @@ function performSearch(query) {
 }
 
 function highlightSearchResults(results) {
-  // Vis.js에서 노드 하이라이트
+  // Vis.js에서 노드 하이라이트 — focusOnNode로 포커스 통일 (타이밍/스케일 일관성)
   if (visNetwork && results.length > 0) {
     const nodeIds = results.map((n) => n.id);
     visNetwork.selectNodes(nodeIds);
-    // 첫 번째 결과로 이동
     if (results.length > 0) {
-      visNetwork.focus(results[0].id, {
-        scale: 1.5,
-        animation: { duration: 300 },
-      });
+      focusOnNode(results[0].id);
     }
   }
 }
@@ -3308,6 +3368,8 @@ function showSearchResults(results, query) {
       const node = NODES.find((n) => n.id === nodeId);
       if (node) {
         selectNode(node);
+        renderGraph();
+        focusOnNode(node.id);
         hideSearchResults();
         const searchInput = document.getElementById("nodeSearch");
         if (searchInput) searchInput.value = "";
@@ -3378,6 +3440,8 @@ function setupSearch() {
       e.preventDefault();
       const node = searchResults[selectedSearchIndex];
       selectNode(node);
+      renderGraph();
+      focusOnNode(node.id);
       hideSearchResults();
       this.value = "";
     } else if (e.key === "Escape") {
@@ -3422,9 +3486,8 @@ window.addEventListener("resize", () => {
   }
 });
 
-// UX: 로고 클릭 시 홈으로 이동
+// UX: 로고(금융회사지배구조) 클릭 시 홈으로 이동 — CTO: ego 모드면 전체 그래프 재로드 후 fit
 function resetToHome() {
-  // 검색 초기화
   const searchInput = document.getElementById("nodeSearch");
   if (searchInput) {
     searchInput.value = "";
@@ -3432,30 +3495,62 @@ function resetToHome() {
     clearSearchHighlight();
   }
 
-  // 선택 노드 초기화
   selectedNode = null;
-  selectedNodeId = null; // CTO: UX 패턴 - 선택 해제
-  connectedNodeIds.clear(); // CTO: 연결 노드 초기화
+  selectedNodeId = null;
+  connectedNodeIds.clear();
 
-  // 필터 초기화 (모든 타입 활성화)
   activeFilters = new Set(GRAPH_CONFIG.nodeTypes);
   document.querySelectorAll(".filter-pill").forEach((pill) => {
     pill.classList.add("active");
   });
 
-  // 그래프 재렌더링
-  renderGraph();
-
-  // 전체 뷰로 fit
-  if (visNetwork) {
-    visNetwork.unselectAll();
-    visNetwork.fit({ animation: { duration: 300 } });
+  // CTO: 지배구조 맵(ego) 보기 후 로고 클릭 시 전체 그래프로 복귀
+  if (isEgoMode) {
+    isEgoMode = false;
+    egoCenterId = null;
+    const banner = document.getElementById("egoBanner");
+    if (banner) banner.classList.add("util-hidden");
+    loadGraph().then(() => {
+      if (visNetwork) {
+        visNetwork.unselectAll();
+        let fitDone = false;
+        const doFit = () => {
+          if (fitDone || !visNetwork) return;
+          fitDone = true;
+          try {
+            visNetwork.fit({ animation: { duration: 300 } });
+          } catch (e) {
+            console.warn("resetToHome fit failed:", e);
+          }
+        };
+        visNetwork.once("stabilizationIterationsDone", doFit);
+        setTimeout(doFit, 550);
+      }
+      showEmptyPanel();
+      updateStatus("홈으로 이동했습니다", true);
+    });
+    return;
   }
 
-  // 우측 패널 빈 상태로
-  showEmptyPanel();
+  renderGraph();
 
-  // 상태 메시지 업데이트
+  if (visNetwork) {
+    visNetwork.unselectAll();
+    let fitDone = false;
+    const doFit = () => {
+      if (fitDone || !visNetwork) return;
+      fitDone = true;
+      try {
+        visNetwork.fit({ animation: { duration: 300 } });
+      } catch (e) {
+        console.warn("resetToHome fit failed:", e);
+      }
+    };
+    visNetwork.once("stabilizationIterationsDone", doFit);
+    setTimeout(doFit, 550);
+  }
+
+  showEmptyPanel();
   updateStatus("홈으로 이동했습니다", true);
 }
 

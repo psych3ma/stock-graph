@@ -46,10 +46,7 @@
 
 ---
 
-## 현재 활성 문서
+## 문서
 
-- **`QA-ISSUES-GRAPH-VISUALIZATION.md`**: QA 이슈 추적 (해결 현황 포함)
-- **`QA-BACKEND-FRONTEND-ISSUES.md`**: 백엔드/프론트 이슈 리스트
-- **`NETWORKX-EXPERT-REVIEW.md`**: NetworkX 전문가 검토 + 적용 내역
-- **`CTO-LAYOUT-HAIRBALL-FIX.md`**: 털뭉치 해소 수정 내역
-- **`CTO-REVIEW-*.md`**: 각종 CTO 검토 문서 (최신 상태)
+- 포트폴리오·정리 가이드: `CTO-PORTFOLIO-REVIEW.md`
+- 아키텍처·이슈 상세: `docs/archive/` 및 README 문서 링크 참고

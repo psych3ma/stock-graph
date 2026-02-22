@@ -17,3 +17,6 @@ __pycache__/
 *.pyc
 .venv/
 node_modules/
+
+# 포트폴리오 정리: 과거 검토 문서는 로컬 참고용, Git 제외
+docs/archive/

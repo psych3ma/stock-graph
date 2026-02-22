@@ -13,7 +13,7 @@ SOURCE_META = {
 }
 
 st.set_page_config(
-    page_title="GraphIQ — 주주 네트워크",
+    page_title="금융회사지배구조 — 주주 네트워크",
     page_icon="🔗",
     layout="wide",
     initial_sidebar_state="expanded",

@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1 import api_router
 from app.core.config import get_settings
@@ -18,6 +19,7 @@ api = FastAPI(
     description="주주 네트워크 자연어 질의 (Neo4j GenAI Stack)",
     version="1.0",
 )
+app.mount("/static", StaticFiles(directory="static"), name="static")
 api.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins_list(),

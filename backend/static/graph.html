@@ -14,7 +14,9 @@
 <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js" defer></script>
 <!-- P2: API Base 주입 (배포 시 환경변수/빌드 시 주입 가능) -->
 <script>
-  // window.GRAPHIQ_API_BASE를 여기서 설정하면 graph.js의 API_BASE가 이를 사용
+  // window.GRAPHIQ_API_BASE를 여기서 설정하면 graph.js의 API_BASE가 이를 사용 
+  // 이 주소를 본인의 Render 백엔드 주소로 설정합니다.
+  window.GRAPHIQ_API_BASE = 'https://stock-graph-y8v7.onrender.com';
   // 예: window.GRAPHIQ_API_BASE = 'https://api.example.com';
   // 배포 시 환경변수로 주입: <script>window.GRAPHIQ_API_BASE = '{{API_BASE}}';</script>
 </script>

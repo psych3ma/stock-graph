@@ -6,7 +6,8 @@ from typing import Any
 
 import httpx
 
-BASE_URL = os.environ.get("GRAPHIQ_API_URL", "http://localhost:8000")
+BASE_URL = os.environ.get("GRAPHIQ_API_URL", "https://stock-graph-y8v7.onrender.com")
+# BASE_URL = os.environ.get("GRAPHIQ_API_URL", "http://localhost:8000")
 TIMEOUT = 60.0
 
 

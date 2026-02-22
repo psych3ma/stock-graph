@@ -11,3 +11,5 @@ uvicorn[standard]
 pydantic-settings
 httpx
 pytest
+aiofiles==23.2.1
+

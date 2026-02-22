@@ -7,6 +7,7 @@ from app.core.config import get_settings
 from app.core.neo4j_indexes import init_indexes_on_startup
 
 
+
 def _cors_origins_list() -> list[str]:
     raw = get_settings().CORS_ORIGINS.strip()
     if not raw or raw == "*":
@@ -19,7 +20,7 @@ api = FastAPI(
     description="주주 네트워크 자연어 질의 (Neo4j GenAI Stack)",
     version="1.0",
 )
-app.mount("/static", StaticFiles(directory="static"), name="static")
+api.mount("/static", StaticFiles(directory="static"), name="static")
 api.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins_list(),

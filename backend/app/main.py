@@ -20,6 +20,13 @@ api = FastAPI(
     description="주주 네트워크 자연어 질의 (Neo4j GenAI Stack)",
     version="1.0",
 )
+
+@api.get("/")
+def health_check():
+    """Render 배포 헬스체크를 위한 루트 경로"""
+    return {"status": "ok", "service": "GraphIQ API"}
+# ---------------------------
+
 api.mount("/static", StaticFiles(directory="static"), name="static")
 api.add_middleware(
     CORSMiddleware,

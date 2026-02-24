@@ -42,7 +42,7 @@ api.include_router(api_router, prefix="/api/v1")
 
 @api.on_event("startup")
 async def startup_event():
-    """앱 기동 시 Neo4j 인덱스 자동 생성 (CTO: 성능 최적화)"""
+    """앱 기동 시 Neo4j 인덱스 자동 생성."""
     try:
         init_indexes_on_startup()
     except Exception as e:

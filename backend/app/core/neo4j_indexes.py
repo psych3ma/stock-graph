@@ -1,8 +1,6 @@
 """
-Neo4j 인덱스 및 제약 조건 관리 모듈.
-
-CTO 관점: 프로덕션 수준의 성능 최적화를 위한 필수 인덱스 및 제약 조건을 자동 생성.
-앱 기동 시 또는 수동으로 호출하여 인덱스를 생성/확인할 수 있습니다.
+Neo4j 인덱스 및 제약 조건 관리.
+앱 기동 시 또는 수동 호출로 인덱스 생성/확인.
 """
 import logging
 from typing import List, Tuple
@@ -14,7 +12,7 @@ from app.services import graph_service
 logger = logging.getLogger(__name__)
 
 
-# ── 인덱스 정의 (CTO: 우선순위별 분류) ────────────────────────────────────────
+# ── 인덱스 정의 (우선순위별) ────────────────────────────────────────────────
 
 # P0 - Critical: 성능에 직접적인 영향
 CRITICAL_INDEXES: List[Tuple[str, str]] = [
@@ -148,7 +146,7 @@ def verify_indexes() -> dict:
 def init_indexes_on_startup():
     """
     앱 기동 시 인덱스를 자동 생성합니다.
-    백엔드 main.py에서 호출하거나, 별도 스크립트로 실행 가능.
+    main.py에서 호출하거나 별도 스크립트로 실행.
     """
     try:
         result = ensure_indexes()

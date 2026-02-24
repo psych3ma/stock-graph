@@ -1,14 +1,17 @@
 /* ═══════════════════════════════════════════════════════════════════════════
-   FILE STRUCTURE (협업용)
-   1) CONFIG   - API_BASE, GRAPH_CONFIG, LAYOUT_CONFIG, NODE_COLORS
-   2) STATE    - NODES, EDGES, positions, selectedNode, isEgoMode, egoMapViewMode
-   3) API      - apiCall, loadGraph, loadEgoGraph, loadNodeDetail
-   4) LAYOUT   - computeHierarchicalLayout, initPositions
-   5) GOVERNANCE MAP - buildWeightedEdgeMatrix, renderWeightedEdgeHeatmap, setGovernanceMapViewMode
-   6) RENDER   - renderGraph, renderGraphWithVisJs
-   7) PANEL    - selectNode, renderNodeDetail, renderNodeDetailFallback, showEmptyPanel
-   8) CHAT     - sendChatMessage, openChatWithContext
-   9) INIT     - 이벤트 바인딩, loadGraph() 호출
+   모듈 구성 (비개발자용)
+   ─────────────────────────────────────────────────────────────────────────
+   [설정] CONFIG    서버 주소, 노드 타입, 레이아웃/색상/문구 (한 곳만 수정)
+   [데이터] STATE   현재 그래프 노드·엣지·선택 상태·캐시
+   [통신] API       서버 요청 (그래프 로드, 노드 상세, 지배구조 맵)
+   [배치] LAYOUT    노드 위치 계산 (서버 레이아웃 또는 클라이언트)
+   [지배구조맵] GOV MAP  히트맵·Ego 뷰 전환
+   [그리기] RENDER  화면에 그래프 그리기 (Vis.js)
+   [패널] PANEL     노드 클릭 시 우측 상세·연결노드·탭
+   [채팅] CHAT      AI 질문 연동 (Streamlit 연동)
+   [시작] INIT      페이지 로드 시 이벤트 연결·첫 데이터 로드
+   ─────────────────────────────────────────────────────────────────────────
+   개발: CONFIG → STATE → API → LAYOUT → RENDER / GOV MAP → PANEL / CHAT → INIT
 ══════════════════════════════════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════
@@ -24,15 +27,15 @@ const API_BASE =
     ? "http://localhost:8000"
     : `${window.location.protocol}//${window.location.hostname}:8000`);
 
-// 그래프 API limit·노드 타입 일관성 (확장 시 이곳만 수정)
-// CTO: Vis.js 단일 렌더링 엔진 (SVG 제거, 유지보수성/확장성 향상)
+// 그래프 API limit·노드 타입 (확장 시 이곳만 수정)
+// Vis.js 단일 렌더링 엔진.
 const GRAPH_CONFIG = {
   limits: { nodes: 500, edges: 200, nodesFallback: 50 },
   nodeTypes: ["company", "person", "major", "institution"],
-  minRatio: 5, // 초기 로딩 시 N% 미만 지분 관계 제외 (Cypher 가지치기, 노이즈·뭉침 감소)
-  useServerLayout: true, // 서버 레이아웃 API 사용 (협업: 백엔드 단일 소스), 실패 시 클라이언트 force로 폴백
-  layoutEngine: "pygraphviz", // PyGraphviz (neato 엔진, 결정론적 레이아웃), 실패 시 NetworkX 폴백
-  openEgoOnNodeClick: false, // CTO: 노드 클릭 시 포커스+상세만 (true면 지배구조 맵 로딩 전체 화면 표시 → UX 이슈)
+  minRatio: 5, // 초기 로딩 시 N% 미만 지분 제외 (노이즈·뭉침 감소)
+  useServerLayout: true, // 서버 레이아웃 사용, 실패 시 클라이언트 force 폴백
+  layoutEngine: "pygraphviz", // PyGraphviz(neato) → 실패 시 NetworkX
+  openEgoOnNodeClick: false, // 노드 클릭 시 포커스+상세만; true면 지배구조 맵 전체 화면
 };
 
 // P2: 운영 설정 상수화 (타임아웃, API 제한 등)
@@ -41,23 +44,21 @@ const API_CONFIG = {
   retryDelay: 1000, // 재시도 지연 (ms)
 };
 
-// CTO: UX 동작 상수 — 노드 클릭→드래그→다른 노드 클릭 시 밀집·홈 복귀 시 레이아웃 복구 (하드코딩 제거)
+// 노드 전환·홈 복귀 시 레이아웃 복구용 상수.
 const UX_CONFIG = {
-  zoomHandlerSkipMsAfterSelect: 400, // 노드 선택 직후 이 시간(ms) 동안은 zoom 핸들러에서 renderGraph 스킵 (이중 렌더·밀집 방지)
+  zoomHandlerSkipMsAfterSelect: 400, // 선택 직후 이 시간(ms) 동안 zoom 핸들러에서 renderGraph 스킵
 };
 
-// CTO: Ego 그래프 설정 상수화 (하드코딩 제거)
-/** 노드 상세 패널 연결 노드 표시 상한 (백엔드 LIMIT 20과 동일, UX 안내용) */
+/** 노드 상세 패널 연결 노드 표시 상한 (서버 LIMIT 20과 동일) */
 const NODE_DETAIL_RELATED_MAX = 20;
 
 const EGO_GRAPH_CONFIG = {
   MAX_HOPS: 2,
   MAX_NODES: 120,
-  // UX CTO: 지배구조 맵 보기와 포커스 차별화 — 'fit'이면 전체 ego 그래프를 뷰에 맞춤, 'focus'면 해당 노드에 줌
-  initialViewAfterLoad: "fit",
+  initialViewAfterLoad: "fit", // 'fit': 전체 맞춤, 'focus': 해당 노드 줌
 };
 
-// CTO: UI 문구 단일 소스 — 하드코딩 제거, 확장성·유지보수·협업 (i18n 준비)
+// UI 문구 단일 소스 (i18n 준비).
 const UI_STRINGS = {
   nodeType: {
     company: "회사",
@@ -73,7 +74,7 @@ const UI_STRINGS = {
   govMap: {
     label: "지배구조 맵",
     viewHeatmap: "지배구조 맵 (가중치 히트맵)",
-    viewEgo: "지배구조 맵 · Ego", // CTO: 한 줄 가독성, "(Ego-Graph)" 줄바꿈 방지
+    viewEgo: "지배구조 맵 · Ego",
     btnHeatmap: "히트맵",
     btnEgo: "Ego 그래프",
     btnExit: "전체 그래프로 돌아가기",
@@ -107,7 +108,7 @@ const UI_STRINGS = {
   },
 };
 
-// CTO: 에러 메시지 상수화 (하드코딩 제거, 다국어 지원 준비)
+// 에러 메시지 단일 소스.
 const ERROR_MESSAGES = {
   EGO_GRAPH_LOAD_FAILED: "지배구조 맵을 불러올 수 없습니다",
   EGO_GRAPH_NODE_NOT_FOUND: "해당 노드를 찾을 수 없거나 연결된 노드가 없습니다.",
@@ -117,22 +118,20 @@ const ERROR_MESSAGES = {
   EGO_GRAPH_LOAD_FAILED_STATUS: "지배구조 맵 로드 실패",
 };
 
-// 레이아웃 정책 (협업 문서): ratio(지분%) → 시각적 거리. "높은 지분 = 가까이"로 통일.
-// - 서버(NetworkX): spring_layout weight=ratio. - 클라이언트(force): idealDist ∝ 1/√ratio (useInverseSqrtEdgeLength).
-// Force Simulation — CTO: 초기 배치 + 물리 엔진이 실시간으로 퍼뜨려야 "별자리" 가능. 격자/기본값만 쓰면 4군데 뭉침.
-// CTO: 초기 뷰 제한 설정 (대량 노드 환경 가독성·밀집 방지 — 그래프가 한 덩어리로 보이는 현상 완화)
+// 레이아웃 정책: ratio(지분%) → 시각적 거리. "높은 지분 = 가까이".
+// Force: 초기 배치+물리로 퍼뜨림. 격자만 쓰면 뭉침.
+// 초기 뷰 제한: 대량 노드 시 가독성·밀집 완화.
 const INITIAL_VIEW_CONFIG = {
   enabled: true,
-  applyWhenOver: 280, // 이 개수 초과 시 제한 적용 (기존 maxNodes만 사용 시 500노드 로드 시 미적용 이슈)
+  applyWhenOver: 280,
   minConnections: 3,
   minRatio: 5,
-  showTypes: ["company", "major", "institution"], // 개인주주(person) 제외 시 밀집 대폭 감소
-  maxNodes: 380, // 최대 표시 노드 수 (1000→380, 확장성·유지보수: 상수만 조정)
+  showTypes: ["company", "major", "institution"],
+  maxNodes: 380,
 };
 
 /**
- * CTO: 단일 소스 — 초기 뷰/전체 그래프 표시 노드 제한 (확장성·유지보수·협업).
- * 초기 랜딩·"전체 그래프로 돌아가기" 클릭 시 동일 경로에서 호출되어 밀집 방지.
+ * 초기 뷰/전체 그래프 표시 노드 제한.
  * @param {Array} nodes - 필터 적용 전 노드 배열 (NODES)
  * @param {Array} edges - 엣지 배열 (EDGES)
  * @param {Set} typeFilterSet - 활성 노드 타입 (activeFilters)
@@ -173,7 +172,7 @@ function computeVisibleNodesForRender(nodes, edges, typeFilterSet) {
   return { visibleNodes: limited, didApplyLimit: true };
 }
 
-/** CTO: API/백엔드와 필터 일관성 — 노드 타입 대소문자 정규화 (필터 미적용 이슈 방지). 단일 진입점. */
+/** 노드 타입 대소문자 정규화 (필터 일관성). */
 function canonicalNodeType(t) {
   return (t && String(t).toLowerCase()) || "";
 }
@@ -181,13 +180,13 @@ function canonicalNodeType(t) {
 const LAYOUT_CONFIG = {
   force: {
     gravity: 0,
-    minDist: 800, // CTO: 노드 간 최소 거리 대폭 증가 (500→800) - 밀집 방지
-    repulsionRange: 6.0, // CTO: 반발 범위 확대 (5.0→6.0)
-    repulsionStrength: 600, // CTO: 반발력 강화 (450→600) - 노드 분리 강화
-    collisionRadiusMultiplier: 8.0, // CTO: 충돌 감지 반경 확대 (5.0→8.0)
-    layoutRadiusMultiplier: 5, // CTO: 레이아웃 반경 확대 (4→5)
-    idealDistMin: 800, // CTO: 이상 거리 최소값 증가 (500→800)
-    idealDistMax: 2000, // CTO: 이상 거리 최대값 증가 (1200→2000)
+    minDist: 800,
+    repulsionRange: 6.0,
+    repulsionStrength: 600,
+    collisionRadiusMultiplier: 8.0,
+    layoutRadiusMultiplier: 5,
+    idealDistMin: 800,
+    idealDistMax: 2000,
     idealDistDegreeFactor: 0.2,
     useInverseSqrtEdgeLength: true,
     idealDistBaseLengthForInverseSqrt: 2000,
@@ -233,23 +232,14 @@ function getNodeColor(node) {
   return isActive ? typeColors.active : typeColors.closed;
 }
 
-/**
- * CTO: 노드 채우기 색상 생성 (범례와 일치하도록 연한 버전)
- * @param {string} hexColor - 헥스 색상 코드
- * @param {number} opacity - 투명도 (0-1)
- * @returns {string} RGBA 색상 문자열
- */
+/** 노드 채우기 색상 (범례 연한 버전). */
 function getNodeFillColor(hexColor, opacity = 0.15) {
   const rgb = hexToRgb(hexColor);
   if (!rgb) return `rgba(255, 255, 255, ${opacity})`;
   return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${opacity})`;
 }
 
-/**
- * CTO: 헥스 색상을 RGB로 변환
- * @param {string} hex - 헥스 색상 코드 (#RRGGBB)
- * @returns {Object|null} {r, g, b} 객체 또는 null
- */
+/** 헥스 → RGB. */
 function hexToRgb(hex) {
   const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
   return result
@@ -261,18 +251,11 @@ function hexToRgb(hex) {
     : null;
 }
 
-/**
- * UX: 안전한 엣지 라벨 포맷팅 함수
- * 백엔드에서 오는 다양한 형식의 데이터를 안전하게 처리
- * @param {Array} edges - 엣지 배열
- * @returns {string} 포맷된 라벨 문자열
- */
+/** 엣지 라벨 포맷 (다양한 형식 안전 처리). */
 function formatEdgeLabel(edges) {
-  // 안전한 숫자 추출 함수 (문자열, 숫자, null 등 모든 경우 처리)
   const safeNumber = (val) => {
     if (val == null || val === "") return 0;
     if (typeof val === "string") {
-      // 문자열에서 숫자만 추출 (예: "22.0%" → 22.0, "3.2%" → 3.2, "22.0% (2건)" → 22.0)
       const cleaned = val.toString().replace(/[^\d.]/g, "");
       const num = parseFloat(cleaned);
       return Number.isNaN(num) ? 0 : num;
@@ -281,25 +264,14 @@ function formatEdgeLabel(edges) {
     return Number.isNaN(n) ? 0 : n;
   };
 
-  // 최대 지분율 계산 (여러 엣지 중 최대값)
   const ratios = edges.map((ed) => safeNumber(ed.ratio));
   const maxRatio = Math.max(...ratios, 0);
   const ratio = Math.max(0, Math.min(100, maxRatio));
-
-  // 관계 건수 계산
   const relCount = edges.reduce((sum, ed) => {
     const count = safeNumber(ed.count);
     return sum + (count > 0 ? count : 1);
   }, 0);
-
-  // UX: 0%인데 관계가 있는 경우 처리 (사용자 혼란 방지)
-  if (ratio === 0 && relCount > 0) {
-    // 0%인데 관계가 있는 경우: 건수가 많을 때만 표시하거나 숨김
-    // 사용자 혼란 방지를 위해 건수가 많을 때만 표시
-    return relCount > 5 ? `${relCount}건` : "";
-  }
-
-  // UX: 라벨 포맷팅 (명확하고 간결하게)
+  if (ratio === 0 && relCount > 0) return relCount > 5 ? `${relCount}건` : "";
   if (relCount > 1) {
     return `${ratio.toFixed(1)}% (${relCount}건)`;
   }
@@ -308,24 +280,12 @@ function formatEdgeLabel(edges) {
 }
 const NODE_RADIUS = { company: 22, person: 16, major: 20, institution: 18 };
 
-/**
- * CTO: 노드 크기 계산 함수 (데이터 기반 동적 크기)
- * 연결 수와 지분율을 고려하여 노드의 중요도를 크기에 반영
- * @param {Object} node - 노드 객체
- * @param {Array} edges - 엣지 배열
- * @param {string|null} selectedNodeId - 선택된 노드 ID
- * @param {Set} connectedNodeIds - 연결된 노드 ID Set
- * @returns {number} 계산된 노드 크기 (px)
- */
+/** 노드 크기 (연결 수·지분율 반영). */
 function calculateNodeSize(node, edges, selectedNodeId, connectedNodeIds) {
   const baseRadius = NODE_RADIUS[node.type] || 18;
   const baseSize = baseRadius * 2;
-
-  // 연결 수 계산
   const nodeEdges = edges.filter((e) => e.from === node.id || e.to === node.id);
   const degree = nodeEdges.length;
-
-  // 전체 노드의 평균 연결 수 계산 (캐싱)
   if (!window._avgDegree || !window._maxDegree) {
     const allDegrees = NODES.map(
       (n) => EDGES.filter((e) => e.from === n.id || e.to === n.id).length,
@@ -337,21 +297,13 @@ function calculateNodeSize(node, edges, selectedNodeId, connectedNodeIds) {
   const avgDegree = window._avgDegree;
   const maxDegree = window._maxDegree;
 
-  // 연결 수 기반 크기 보정
   let degreeFactor = 1.0;
-  if (degree >= maxDegree * 0.7) {
-    degreeFactor = 1.3; // 상위 30%: +30%
-  } else if (degree >= avgDegree * 1.5) {
-    degreeFactor = 1.2; // 평균의 1.5배 이상: +20%
-  } else if (degree >= avgDegree) {
-    degreeFactor = 1.1; // 평균 이상: +10%
-  } else if (degree < avgDegree * 0.5 && degree > 0) {
-    degreeFactor = 0.9; // 평균의 절반 미만: -10%
-  } else if (degree === 0) {
-    degreeFactor = 0.85; // 연결 없음: -15%
-  }
+  if (degree >= maxDegree * 0.7) degreeFactor = 1.3;
+  else if (degree >= avgDegree * 1.5) degreeFactor = 1.2;
+  else if (degree >= avgDegree) degreeFactor = 1.1;
+  else if (degree < avgDegree * 0.5 && degree > 0) degreeFactor = 0.9;
+  else if (degree === 0) degreeFactor = 0.85;
 
-  // 지분율 기반 크기 보정 (선택적, 데이터 있는 경우만)
   let ratioFactor = 1.0;
   if (nodeEdges.length > 0) {
     const maxRatio = Math.max(...nodeEdges.map((e) => Number(e.ratio || 0)));
@@ -364,27 +316,18 @@ function calculateNodeSize(node, edges, selectedNodeId, connectedNodeIds) {
     }
   }
 
-  // 상태별 조정
   const isSelected = nodeIdsEqual(selectedNodeId, node.id);
   const isConnected = selectedNodeId ? connectedNodeIds.has(String(node.id)) : false;
   let stateFactor = 1.0;
-  if (isSelected) {
-    stateFactor = 1.2; // 선택: +20%
-  } else if (!isConnected && selectedNodeId) {
-    stateFactor = 0.7; // 비연결: -30%
-  }
-
-  // 최종 크기 계산
+  if (isSelected) stateFactor = 1.2;
+  else if (!isConnected && selectedNodeId) stateFactor = 0.7;
   const finalSize = baseSize * degreeFactor * ratioFactor * stateFactor;
-
-  // 크기 제한 (가독성 및 성능 보장)
-  const minSize = Math.max(16, baseSize * 0.6); // 최소 16px 또는 기본의 60%
-  const maxSize = Math.min(80, baseSize * 1.8); // 최대 80px 또는 기본의 180%
+  const minSize = Math.max(16, baseSize * 0.6);
+  const maxSize = Math.min(80, baseSize * 1.8);
   return Math.max(minSize, Math.min(maxSize, finalSize));
 }
 
-/** 레이아웃용 반지름: 원 + 라벨 박스(가로·세로)까지 포함한 '물리적 크기'. 충돌/반발/분리·fitToView에만 사용.
- *  node 인자 있으면 라벨 길이·세로(아래) 반영; label 없으면 name 등 표시용 필드 폴백. */
+/** 레이아웃 반지름: 원+라벨 포함. 충돌/반발/fitToView용. */
 function getLayoutRadius(nodeOrType) {
   const type = typeof nodeOrType === "object" ? nodeOrType?.type : nodeOrType;
   const base = NODE_RADIUS[type] || 18;
@@ -416,7 +359,7 @@ const LABEL_CONFIG = {
   fontSizeSelected: 13,
 };
 
-/** 지분율(%) 표시용: 0~100으로 clamp. API/원시 데이터 오류(100% 초과) 시에도 잘못된 수치 노출 방지. */
+/** 지분율 0~100 clamp. */
 function formatRatio(val) {
   if (val == null || val === "") return "";
   const n = Number(val);
@@ -424,7 +367,7 @@ function formatRatio(val) {
   return Math.min(100, Math.max(0, n));
 }
 
-/** CSS 변수에서 색상 읽기 (테마 일관성, 하드코딩 제거) */
+/** CSS 변수에서 색상 읽기. */
 function getThemeColor(name) {
   const v = getComputedStyle(document.documentElement).getPropertyValue(
     "--" + name,
@@ -448,7 +391,6 @@ function getThemeColor(name) {
 let NODES = [];
 let EDGES = [];
 let positions = {};
-// CTO: SVG 제거로 drag/pan/zoom 변수 불필요 (Vis.js가 내부적으로 처리)
 let selectedNode = null;
 let activeFilters = new Set(GRAPH_CONFIG.nodeTypes);
 let nodeCounts = Object.fromEntries(GRAPH_CONFIG.nodeTypes.map((t) => [t, 0])); // 노드 타입별 개수
@@ -456,16 +398,12 @@ let chatContext = null;
 let nodeDetailCache = {};
 let isEgoMode = false;
 let egoCenterId = null;
-/** 지배구조 맵 뷰 모드: 'heatmap' | 'ego'. 전환 시 재렌더만 하면 되도록 단일 진입점 유지 */
 const GOVERNANCE_MAP_VIEW = { HEATMAP: "heatmap", EGO: "ego" };
 let egoMapViewMode = GOVERNANCE_MAP_VIEW.EGO;
 
-// CTO: 히트맵 기능 on/off — 확장성·유지보수 (하드코딩 없이 설정으로 제어)
-const GOV_MAP_CONFIG = {
-  heatmapEnabled: false,
-};
+const GOV_MAP_CONFIG = { heatmapEnabled: false };
 
-/** 지배구조 맵 DOM ID (HTML과 단일 소스, 협업/리팩터 시 검색 용이) */
+/** 지배구조 맵 DOM ID (HTML과 일치) */
 const GOV_MAP_IDS = {
   wrap: "egoHeatmapWrap",
   banner: "egoBanner",
@@ -473,11 +411,9 @@ const GOV_MAP_IDS = {
   btnHeatmap: "egoViewHeatmapBtn",
   btnEgo: "egoViewEgoBtn",
 };
-// CTO: UX 패턴 - 선택된 노드와 연결된 노드 추적 (dimming 효과용)
 let selectedNodeId = null;
 let connectedNodeIds = new Set();
-// CTO: 노드 선택 직후 zoom 핸들러에서 renderGraph 스킵 (이중 렌더로 인한 밀집 방지)
-let lastNodeSelectionTime = 0;
+let lastNodeSelectionTime = 0; // 선택 직후 zoom 핸들러에서 renderGraph 스킵
 
 /* ═══════════════════════════════════════════
    API
@@ -519,7 +455,7 @@ async function apiCall(endpoint, options = {}) {
   }
 }
 
-// CTO: “전체 그래프로 돌아가기” — 로고 클릭(ego 시)과 동일한 완료 동작으로 사이드이펙트 방지
+// "전체 그래프로 돌아가기" — 로고 클릭(ego 시)과 동일 완료 동작
 function exitEgoMode() {
   isEgoMode = false;
   egoCenterId = null;
@@ -546,12 +482,12 @@ function exitEgoMode() {
       visNetwork.once("stabilizationIterationsDone", doFit);
       setTimeout(doFit, 550);
     }
-    showEmptyPanel(true); // QA: 재렌더 생략 — 밀집 재현 방지 (loadGraph 내 이미 renderGraph 완료)
+    showEmptyPanel(true); // 재렌더 생략 (loadGraph 내 이미 renderGraph 완료)
     updateStatus("전체 그래프로 돌아갔습니다", true);
   });
 }
 
-/** NetworkX 레이아웃 API 호출. 0~1 정규화 좌표를 뷰포트 픽셀로 스케일. 협업: ratio → 시각적 거리 규칙은 백엔드와 동일. */
+/** 서버 레이아웃 API. 0~1 좌표 → 뷰포트 픽셀. ratio → 시각적 거리. */
 async function fetchServerLayout(nodes, edges, viewportW, viewportH) {
   const pad = LAYOUT_CONFIG.force.padding;
   const innerW = Math.max(1, viewportW - 2 * pad);
@@ -585,13 +521,13 @@ async function fetchServerLayout(nodes, edges, viewportW, viewportH) {
 }
 
 async function loadEgoGraph(nodeId) {
-  // CTO: nodeId를 상수로 저장하여 catch 블록에서도 사용 가능하도록
+  // catch 블록에서도 사용하도록 상수로 저장
   const targetNodeId = nodeId;
   
   try {
     isEgoMode = true;
     egoCenterId = targetNodeId;
-    // CTO: UX 개선 - 메시지 일관성 유지
+    // 메시지 일관성
     showGraphLoading(
       LOADING_MESSAGES.loadingEgo,
       LOADING_GUIDANCE.loadingEgo,
@@ -608,7 +544,7 @@ async function loadEgoGraph(nodeId) {
       return;
     }
     
-    // CTO: ego_id 검증 추가
+    // ego_id 검증
     if (!res.ego_id) {
       console.error("Ego graph response missing ego_id:", res);
       updateStatus(ERROR_MESSAGES.EGO_GRAPH_DATA_ERROR, false);
@@ -634,9 +570,8 @@ async function loadEgoGraph(nodeId) {
     updateStatus(UI_STRINGS.govMap.statusEgoLoaded, true);
     hideGraphLoading();
     selectedNode = NODES.find((n) => n.id === res.ego_id) || null;
-    selectedNodeId = res.ego_id; // CTO: 상태 일관성 — 포커스/렌더링과 동기화
+    selectedNodeId = res.ego_id;
     if (selectedNode) {
-      // CTO: 노드 상세 전환 시에도 로딩 안내 적용 (검색·직접 클릭 경로와 동일)
       switchTabById("detail");
       renderNodeDetailFallback(selectedNode);
       const requestedNodeId = selectedNode.id;
@@ -664,7 +599,7 @@ async function loadEgoGraph(nodeId) {
       }
     }
     setGovernanceMapViewMode(egoMapViewMode);
-    // UX CTO: 지배구조 맵 보기와 포커스 차별화 — fit이면 전체 ego를 뷰에 맞춤, focus면 해당 노드에 줌
+    // fit: 전체 맞춤, focus: 해당 노드 줌
     if (egoMapViewMode === GOVERNANCE_MAP_VIEW.EGO && visNetwork) {
       const viewBehavior = EGO_GRAPH_CONFIG.initialViewAfterLoad || "fit";
       requestAnimationFrame(() => {
@@ -690,12 +625,12 @@ async function loadEgoGraph(nodeId) {
     hideGraphLoading();
     console.error("loadEgoGraph failed:", e);
     
-    // CTO: 에러 타입별 맞춤 처리 (alert 제거, 인라인 메시지로 변경)
+    // 에러 타입별 인라인 메시지
     const errorType = classifyError(e);
     const errorMessage = e.message || "알 수 없는 오류가 발생했습니다";
     
     if (errorType === ERROR_CODES.NETWORK_ERROR || errorType === ERROR_CODES.BACKEND_CONNECTION_FAILED) {
-      // 네트워크/백엔드 연결 오류는 showConnectionError 사용
+      // 네트워크/서버 연결 오류는 showConnectionError 사용
       showConnectionError(e);
     } else {
       // 404 및 기타 에러는 노드 상세 패널에 인라인 메시지 표시
@@ -842,7 +777,7 @@ function showGovernanceMapEgoView() {
   setGovernanceMapViewMode(GOVERNANCE_MAP_VIEW.EGO);
 }
 
-// CTO: DOM 준비 상태 확인 함수 추가
+// DOM 준비 확인
 function ensureDOMReady() {
   return new Promise((resolve) => {
     if (document.readyState === "loading") {
@@ -861,15 +796,15 @@ function ensureDOMReady() {
 
 async function loadGraph() {
   try {
-    // CTO: 전체 그래프(초기 랜딩·전체 그래프로 돌아가기) 시 제한 적용 알림을 다시 보여줄 수 있도록 리셋
+    // 전체 그래프 진입 시 제한 알림 리셋
     window._initialViewNotified = false;
-    // QA: loadGraph → renderGraph 경로에서 physics 재활성화 억제 (전체 그래프 진입 시 밀집 방지)
+    // 전체 그래프 진입 시 physics 재활성화 억제
     window._loadGraphRendering = true;
 
-    // CTO: DOM 준비 상태 확인
+    // DOM 준비 확인
     await ensureDOMReady();
 
-    // CTO: 컨테이너 존재 사전 확인
+    // 컨테이너 존재 확인
     const container = document.getElementById("visNetwork");
     if (!container) {
       console.error("초기화 시점에 visNetwork 컨테이너를 찾을 수 없습니다:", {
@@ -891,7 +826,7 @@ async function loadGraph() {
     const banner = document.getElementById(GOV_MAP_IDS.banner);
     if (banner) banner.classList.add("util-hidden");
     updateStatus("데이터 로딩 중...", false);
-    // CTO: UX 개선 - 메시지 일관성 유지
+    // 메시지 일관성
     showGraphLoading(
       LOADING_MESSAGES.connecting,
       LOADING_GUIDANCE.connecting,
@@ -904,13 +839,13 @@ async function loadGraph() {
     try {
       await apiCall("/ping");
     } catch (e) {
-      updateStatus("백엔드 연결 실패", false, ERROR_CODES.BACKEND_CONNECTION_FAILED);
+      updateStatus("서버 연결 실패", false, ERROR_CODES.BACKEND_CONNECTION_FAILED);
       console.error("Backend ping failed:", e);
       hideGraphLoading();
       showConnectionError(e);
       return;
     }
-    // CTO: UX 개선 - 명확한 시간 안내 ("최대 1분까지")
+    // 시간 안내 ("최대 1분")
     showGraphLoading(
       "그래프 데이터 불러오는 중…",
       "데이터가 많으면 최대 1분까지 걸릴 수 있습니다",
@@ -945,7 +880,7 @@ async function loadGraph() {
       else showConnectionError();
       return;
     }
-    // CTO: UX 개선 - 메시지 일관성 유지
+    // 메시지 일관성
     showGraphLoading(
       LOADING_MESSAGES.loadingNodes,
       LOADING_GUIDANCE.loadingNodes,
@@ -1014,7 +949,7 @@ async function loadGraph() {
           (n) => n && n.id,
         );
         NODES.push(...missingNodes);
-        // CTO: 개발 환경에서만 로그 출력
+        // 개발 환경에서만 로그
         const isDevelopment =
           window.location.hostname === "localhost" ||
           window.location.hostname === "127.0.0.1" ||
@@ -1033,7 +968,7 @@ async function loadGraph() {
       (e) => finalNodeIds.has(e.from) && finalNodeIds.has(e.to),
     );
 
-    // CTO: 구조화된 로그 출력 (프로덕션 환경에서는 숨김)
+    // 프로덕션에서는 숨김
     const isDevelopment =
       window.location.hostname === "localhost" ||
       window.location.hostname === "127.0.0.1" ||
@@ -1070,7 +1005,7 @@ async function loadGraph() {
       return;
     }
 
-    // CTO: 레이아웃/positions 계산을 위해 최소 1개 타입 필터 보장 — "positions not initialized yet" 방지
+    // positions 계산을 위해 최소 1개 타입 필터 보장
     if (activeFilters.size === 0) {
       activeFilters = new Set(GRAPH_CONFIG.nodeTypes);
       document.querySelectorAll(".filter-pill").forEach((pill) => {
@@ -1079,14 +1014,14 @@ async function loadGraph() {
     }
 
     updateStatus("레이아웃 계산 중...", false);
-    // CTO: UX 개선 - 메시지 일관성 유지
+    // 메시지 일관성
     showGraphLoading(
       LOADING_MESSAGES.computingLayout,
       LOADING_GUIDANCE.computingLayout,
       75,
       2,
     );
-    // CTO: 초기 배치가 "격자/기본값"만 쓰지 않도록 뷰포트가 준비된 뒤 레이아웃 실행
+    // 뷰포트 준비 후 레이아웃 실행
     await new Promise((r) => requestAnimationFrame(r));
     getGraphViewport();
     let vp = getGraphViewport();
@@ -1094,7 +1029,7 @@ async function loadGraph() {
       await new Promise((r) => setTimeout(r, 80));
       vp = getGraphViewport();
     }
-    // CTO: 타 서비스 패턴 - 서버 레이아웃은 초기 위치 힌트로만 사용
+    // 서버 레이아웃은 초기 위치 힌트로만 사용
     // 실제 레이아웃은 Vis.js physics가 자동으로 계산
     let layoutDone = false;
     if (GRAPH_CONFIG.useServerLayout) {
@@ -1140,7 +1075,7 @@ async function loadGraph() {
       }
     }
 
-    // CTO: "positions not initialized yet" 방지 — 레이아웃 실패/필터 꺼짐 등으로 positions 비었을 때 최소 fallback
+    // positions 비었을 때 최소 fallback
     if (NODES.length > 0 && Object.keys(positions).length === 0) {
       const vp = getGraphViewport();
       const cx = vp.width / 2;
@@ -1156,7 +1091,7 @@ async function loadGraph() {
     }
 
     updateStatus("렌더링 중...", false);
-    // CTO: UX 개선 - 메시지 일관성 유지
+    // 메시지 일관성
     showGraphLoading(
       LOADING_MESSAGES.rendering,
       LOADING_GUIDANCE.rendering,
@@ -1164,10 +1099,8 @@ async function loadGraph() {
       3,
     );
     try {
-      // CTO: Vis.js는 waitForVisJs()에서 이미 확인됨
       renderGraph();
-      window._loadGraphRendering = false; // QA: 전체 그래프 진입 후 physics 억제 플래그 해제
-      // CTO: Vis.js는 렌더링 후 자동으로 fit
+      window._loadGraphRendering = false;
       if (visNetwork) {
         setTimeout(() => {
           visNetwork.fit({ animation: { duration: 300 } });
@@ -1191,7 +1124,7 @@ async function loadGraph() {
   }
 }
 
-// CTO: 에러 분류 시스템
+// 에러 분류
 const ERROR_CODES = {
   CONTAINER_NOT_FOUND: "CONTAINER_001",
   BACKEND_CONNECTION_FAILED: "BACKEND_001",
@@ -1203,7 +1136,7 @@ const ERROR_CODES = {
   UNKNOWN: "UNKNOWN_001",
 };
 
-// CTO: 자동 재시도 카운터 (전역 변수)
+// 자동 재시도 카운터
 let retryCount = 0;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_BASE = 3000; // 3초
@@ -1230,7 +1163,7 @@ function classifyError(err) {
   return ERROR_CODES.UNKNOWN;
 }
 
-// CTO: 자동 재시도 기능 (최대 3회, 지수 백오프)
+// 자동 재시도 (최대 3회, 지수 백오프)
 function retryConnection() {
   retryCount++;
   if (retryCount > MAX_RETRIES) {
@@ -1273,7 +1206,7 @@ function toggleErrorDetails() {
   }
 }
 
-// CTO: 에러 메시지 CSS 분리 및 자동 재시도 기능 통합
+// 에러 메시지·재시도 UI
 function showConnectionError(err) {
   const graphArea = document.getElementById("graphArea");
   if (!graphArea) return;
@@ -1309,7 +1242,7 @@ function showConnectionError(err) {
     <div class="error-container">
       <div class="error-icon">⚠️</div>
       <h2 class="error-title">${userMessage}</h2>
-      <p class="error-message">백엔드 서버가 실행 중인지 확인해주세요.${remoteTip}</p>
+      <p class="error-message">서버가 실행 중인지 확인해주세요.${remoteTip}</p>
       <p class="error-message" style="margin-top:8px;font-size:12px;color:var(--text-3);">
         연결 시도 주소: <code style="word-break:break-all;">${tryUrl}</code>
       </p>
@@ -1343,7 +1276,7 @@ function showConnectionError(err) {
   }
 }
 
-// CTO: CSS 클래스 사용으로 변경
+// CSS 클래스 사용
 function showServiceUnavailable() {
   const graphArea = document.getElementById("graphArea");
   if (!graphArea) return;
@@ -1365,7 +1298,7 @@ function showServiceUnavailable() {
   `;
 }
 
-// CTO: CSS 클래스 사용으로 변경
+// CSS 클래스 사용
 function showEmptyState() {
   const graphArea = document.getElementById("graphArea");
   if (!graphArea) return;
@@ -1381,7 +1314,7 @@ function showEmptyState() {
   `;
 }
 
-// CTO: Ego 그래프 에러 메시지 렌더링 함수 (하드코딩 제거)
+// Ego 그래프 에러 메시지 렌더
 function renderEgoGraphError(errorType, errorMessage, nodeId) {
   const errorDetails = {
     NOT_FOUND: ERROR_MESSAGES.EGO_GRAPH_NODE_NOT_FOUND,
@@ -1403,15 +1336,15 @@ function renderEgoGraphError(errorType, errorMessage, nodeId) {
   `;
 }
 
-// CTO: Ego 그래프 에러 표시 함수 (사이드 이펙트 최소화)
+// Ego 그래프 에러 표시
 function showEgoGraphError(errorType, errorMessage, nodeId) {
   const nodeDetail = document.getElementById("nodeDetail");
   if (!nodeDetail) return;
   
-  // CTO: 기존 내용을 완전히 대체 (에러 상태 명확화)
+  // 기존 내용 대체 (에러 상태 명확화)
   nodeDetail.innerHTML = renderEgoGraphError(errorType, errorMessage, nodeId);
   
-  // CTO: 이벤트 리스너는 전역 이벤트 위임으로 처리 (아래 setupEgoGraphErrorListeners 참조)
+  // 이벤트 위임 (setupEgoGraphErrorListeners)
 }
 
 async function loadNodeDetail(nodeId) {
@@ -1443,7 +1376,7 @@ async function sendChatMessage(question) {
   }
 }
 
-// CTO: 헤더 메시지 간소화 - 20자 이하로 제한, 툴팁으로 전체 메시지 표시
+// 헤더 메시지 20자 제한, 툴팁에 전체 표시
 function updateStatus(text, ok, errorCode = null) {
   const el = document.getElementById("statusText");
   if (el) {
@@ -1462,36 +1395,9 @@ function updateStatus(text, ok, errorCode = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// LEGACY LOADING OVERLAY FUNCTIONS (주석처리 - 참고용)
-// 기존: graphLoadingOverlay, graphLoadingStep, graphLoadingHint
-// 새로운: loadingOverlay, loadingText, loadingGuidance, loadingSteps, loadingBar
 // ═══════════════════════════════════════════════════════════════════════════
-/*
-function showGraphLoading(stepText, hintText) {
-  const overlay = document.getElementById('graphLoadingOverlay');
-  const stepEl = document.getElementById('graphLoadingStep');
-  const hintEl = document.getElementById('graphLoadingHint');
-  if (overlay) {
-    overlay.classList.remove('hidden');
-    if (stepEl) stepEl.textContent = stepText || '데이터 로딩 중...';
-    if (hintEl) hintEl.textContent = hintText || '잠시만 기다려 주세요';
-  }
-}
-
-function hideGraphLoading() {
-  const overlay = document.getElementById('graphLoadingOverlay');
-  if (overlay) overlay.classList.add('hidden');
-}
-*/
-
-// ═══════════════════════════════════════════════════════════════════════════
-// NEW LOADING OVERLAY FUNCTIONS (Unified Variant)
-// CTO: 단계별 진행률 표시, 프로그레스바, 단계 인디케이터 지원
-// UX: 명확한 피드백, 접근성 고려, 사용자 친화적 메시지
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════════════
-// LOADING MESSAGES CONFIG (CTO: 메시지 중앙 관리, 유지보수성 향상)
+// LOADING (로딩 오버레이: loadingOverlay, loadingText, loadingSteps, loadingBar)
+// 단계별 진행률·접근성·메시지 단일 소스
 // ═══════════════════════════════════════════════════════════════════════════
 const LOADING_MESSAGES = {
   default: "UI 구성 중…",
@@ -1501,14 +1407,14 @@ const LOADING_MESSAGES = {
   computingLayout: "그래프 구성 중…",
   rendering: "렌더링 중…",
   loadingEgo: "지배구조 맵 로딩 중…",
-  // CTO: 노드 상세 — 단일 소스, 추후 백엔드 진행도 이벤트 시 updateNodeDetailLoadingMessage로 확장
+  //  노드 상세 — 단일 소스, 추후 서버 진행도 이벤트 시 updateNodeDetailLoadingMessage로 확장
   nodeDetailLoading: "노드 상세 불러오는 중…",
   nodeDetailLoadError: "상세 정보를 불러올 수 없습니다.",
 };
 
 const LOADING_GUIDANCE = {
   connecting: "Backend 서버에 연결합니다",
-  loadingData: "데이터가 많으면 최대 1분까지 걸릴 수 있습니다", // CTO: UX 개선 - "최대" 명시
+  loadingData: "데이터가 많으면 최대 1분까지 걸릴 수 있습니다", //  UX 개선 - "최대" 명시
   loadingNodes: "연결된 노드 정보를 불러옵니다",
   computingLayout: "노드 위치를 계산합니다 (잠시 걸릴 수 있습니다)",
   rendering: "그래프를 그리는 중입니다",
@@ -1534,7 +1440,7 @@ function showGraphLoading(
   overlay.classList.remove("hidden");
   overlay.setAttribute("aria-busy", "true");
 
-  // 메시지 업데이트 (CTO: 기본값 제공)
+  // 메시지 업데이트 (기본값)
   if (textEl) textEl.textContent = stepText || LOADING_MESSAGES.default;
   if (guidanceEl) {
     if (hintText) {
@@ -1587,7 +1493,7 @@ function hideGraphLoading() {
     overlay.setAttribute("aria-busy", "false");
   }
 
-  // CTO: 모든 단계 완료 처리
+  //  모든 단계 완료 처리
   if (stepsEl) {
     const stepItems = stepsEl.querySelectorAll(".step-item");
     stepItems.forEach((item) => {
@@ -1600,10 +1506,10 @@ function hideGraphLoading() {
 /* ═══════════════════════════════════════════
    GRAPH ENGINE (Vis.js 단일 체제)
 ═══════════════════════════════════════════ */
-// CTO: ID 변경 (tooltip → graphTooltip)
+//  ID 변경 (tooltip → graphTooltip)
 const tooltip = document.getElementById("graphTooltip");
 
-/** CTO: 캔버스 크기 단일 소스 - Vis.js 컨테이너는 CSS 100%로 처리 */
+/** 캔버스 크기 단일 소스 - Vis.js 컨테이너는 CSS 100%로 처리 */
 function getGraphViewport() {
   const graphArea = document.getElementById("graphArea");
   if (!graphArea) return { width: 900, height: 600 };
@@ -1734,7 +1640,7 @@ function getConnectedComponents(nodes, edges) {
   return components.sort((a, b) => b.length - a.length); // 큰 컴포넌트 먼저
 }
 
-/** 협업: 그래프 단일 뷰 모델. 레이아웃/렌더가 동일한 allNodes·차수·컴포넌트 참조. */
+/** 그래프 단일 뷰 모델. 레이아웃/렌더가 동일한 allNodes·차수·컴포넌트 참조. */
 function buildGraphView(nodes, edges, typeFilterSet) {
   const connectedNodeIds = new Set();
   edges.forEach((e) => {
@@ -1807,7 +1713,7 @@ function initPositions() {
         const col = idx % nCols;
         const cx = extent.xMin + (col + 0.5) * cellW;
         const cy = extent.yMin + (row + 0.5) * cellH;
-        // CTO: 노드 겹침 방지 - 노드 수에 비례해 초기 배치 반경 확대
+        //  노드 겹침 방지 - 노드 수에 비례해 초기 배치 반경 확대
         const minRadiusByCount = Math.max(comp.length * 24, 80); // 16→24, 55→80으로 확대
         const radiusX = Math.min(
           cellW * 0.48,
@@ -1834,7 +1740,7 @@ function initPositions() {
       const baseRadiusY = useFullArea
         ? (extent.yMax - extent.yMin) * 0.5
         : Math.min(W, H) * 0.45;
-      // CTO: 노드 겹침 방지 - 단일 컴포넌트도 노드 수에 비례해 원을 크게 확장
+      //  노드 겹침 방지 - 단일 컴포넌트도 노드 수에 비례해 원을 크게 확장
       const radiusX = Math.max(baseRadiusX, allNodes.length * 20); // 12→20으로 확대 (밀집 방지)
       const radiusY = Math.max(baseRadiusY, allNodes.length * 20);
       const sortedNodes = [...allNodes].sort(
@@ -1933,8 +1839,7 @@ function initPositions() {
               }
             });
 
-            // Spring(링크): 반발 워밍업 구간에서는 적용 안 함 → 먼저 퍼뜨린 뒤 링크로 구조 유지 (CTO)
-            const repulsionOnlyIter = cfg.repulsionOnlyIter ?? 0;
+            // Spring(링크): 반발 워밍업 구간에서는 적용 안 함 → 먼저 퍼뜨린 뒤 링크로 구조 유지            const repulsionOnlyIter = cfg.repulsionOnlyIter ?? 0;
             if (repulsionOnlyIter > 0 && iter < repulsionOnlyIter) {
               // 워밍업: 반발+충돌만. 링크 힘 없음.
             } else {
@@ -2093,24 +1998,24 @@ function initPositions() {
 }
 
 let visNetwork = null; // Vis.js 네트워크 인스턴스
-let visNetworkEventsSetup = false; // QA: 이벤트 리스너 중복 등록 방지
-let physicsEnabledState = false; // CTO: physics 상태 추적 (getOptions 대신 사용)
+let visNetworkEventsSetup = false; //  이벤트 리스너 중복 등록 방지
+let physicsEnabledState = false; //  physics 상태 추적 (getOptions 대신 사용)
 
-// QA/CTO: getScale 비정상(0/NaN) 시 1.0 반환 — 라벨·줌 컨트롤 사이드 이펙트 방지, 단일 진입점
+//  getScale 비정상(0/NaN) 시 1.0 반환 — 라벨·줌 컨트롤 사이드 이펙트 방지, 단일 진입점
 function getScaleSafe(network) {
   if (!network || typeof network.getScale !== "function") return 1.0;
   const s = network.getScale();
   return typeof s === "number" && s > 0 ? s : 1.0;
 }
 
-// QA/CTO: 검색/연결 노드 클릭 시 노드 이름 미표시 방지 — API·DOM·Vis.js 간 id 타입(문자열/숫자) 불일치 흡수, 단일 진입점
+//  검색/연결 노드 클릭 시 노드 이름 미표시 방지 — API·DOM·Vis.js 간 id 타입(문자열/숫자) 불일치 흡수, 단일 진입점
 function nodeIdsEqual(a, b) {
   return a != null && b != null && String(a) === String(b);
 }
 
 /**
- * CTO: 빈 공간 클릭 시 선택 해제만 반영 — setData/renderGraph 호출 없이 기존 노드 스타일만 갱신.
- * 레이아웃·physics 유지로 "한 덩어리로 붙는" 현상 및 지속적 밀집 재현 방지 (확장성·유지보수).
+ * 빈 공간 클릭 시 선택 해제만 반영 — setData/renderGraph 호출 없이 기존 노드 스타일만 갱신.
+ * 레이아웃·physics 유지로 "한 덩어리로 붙는" 현상 및 지속적 밀집 재현 방지).
  */
 function clearSelectionVisualState(network) {
   if (!network || !network.body || !network.body.data || !network.body.data.nodes) return;
@@ -2138,7 +2043,7 @@ function clearSelectionVisualState(network) {
     });
   }
   if (updates.length > 0) nodesDataSet.update(updates);
-  // QA: 선택 시 비연결 엣지 dimming(0.2) 해제 — 엣지도 opacity 1로 복원
+  //  선택 시 비연결 엣지 dimming(0.2) 해제 — 엣지도 opacity 1로 복원
   const edgesDataSet = network.body.data.edges;
   if (edgesDataSet && typeof edgesDataSet.getIds === "function") {
     const edgeIds = edgesDataSet.getIds();
@@ -2158,7 +2063,7 @@ function clearSelectionVisualState(network) {
   }
 }
 
-// CTO: Vis.js 이벤트 리스너 설정 (UX 패턴 반영)
+//  Vis.js 이벤트 리스너 설정 (UX 패턴 반영)
 function setupVisNetworkEvents(network) {
   if (visNetworkEventsSetup) return;
 
@@ -2175,16 +2080,16 @@ function setupVisNetworkEvents(network) {
         selectNode(node); // 내부에서 renderGraph 후 focusOnNode 호출 (포커스·유동성 이슈 방지)
       }
     } else {
-      // CTO: 빈 공간 클릭 시 전체 재렌더 없이 선택 해제만 적용 — 밀집 재현·지속 이슈 방지
+      //  빈 공간 클릭 시 전체 재렌더 없이 선택 해제만 적용 — 밀집 재현·지속 이슈 방지
       selectedNodeId = null;
       connectedNodeIds.clear();
       network.unselectAll();
       clearSelectionVisualState(network);
-      showEmptyPanel(true); // QA: 재렌더 생략으로 레이아웃 유지(밀집 재현 방지)
+      showEmptyPanel(true); //  재렌더 생략으로 레이아웃 유지(밀집 재현 방지)
     }
   });
 
-  // CTO: 호버 시 라벨 강조 (가독성 개선)
+  //  호버 시 라벨 강조 (가독성 개선)
   network.on("hoverNode", (params) => {
     const node = NODES.find((n) => nodeIdsEqual(n.id, params.node));
     if (node) {
@@ -2233,13 +2138,13 @@ function setupVisNetworkEvents(network) {
 
 function renderGraphWithVisJs() {
   if (NODES.length === 0) return;
-  // QA/CTO: ego(지배구조 맵)는 Vis.js hierarchical이 위치 계산 — positions 불필요. 비-ego에서만 positions 필수
+  //  ego(지배구조 맵)는 Vis.js hierarchical이 위치 계산 — positions 불필요. 비-ego에서만 positions 필수
   if (!isEgoMode && Object.keys(positions).length === 0) {
     console.warn("renderGraphWithVisJs: positions not initialized yet");
     return;
   }
 
-  // CTO: Vis.js 라이브러리 로드 확인 (필수)
+  //  Vis.js 라이브러리 로드 확인 (필수)
   if (typeof vis === "undefined" || !vis.Network) {
     console.error(
       "Vis.js not loaded. This should not happen if waitForVisJs() worked correctly.",
@@ -2248,11 +2153,11 @@ function renderGraphWithVisJs() {
     return;
   }
 
-  // CTO: Vis.js 컨테이너 확인 (레거시 컨테이너 참조 제거 완료)
+  //  Vis.js 컨테이너 확인 (레거시 컨테이너 참조 제거 완료)
   let container = document.getElementById("visNetwork");
 
   if (!container) {
-    // CTO: 상세한 디버깅 정보 제공
+    //  상세한 디버깅 정보 제공
     const graphArea = document.getElementById("graphArea");
     const allContainers = graphArea
       ? Array.from(
@@ -2284,21 +2189,21 @@ function renderGraphWithVisJs() {
       ERROR_CODES.CONTAINER_NOT_FOUND,
     );
 
-    // CTO: 사용자에게 명확한 안내
+    //  사용자에게 명확한 안내
     console.error(
       "그래프 컨테이너가 없습니다. 페이지를 새로고침하거나 개발자에게 문의하세요.",
     );
     return;
   }
 
-  // QA: 컨테이너 크기 초기화 보장 (CSS 100%만으로는 초기 렌더링 실패 가능)
+  //  컨테이너 크기 초기화 보장 (CSS 100%만으로는 초기 렌더링 실패 가능)
   const { width: vpW, height: vpH } = getGraphViewport();
   if (container.offsetWidth === 0 || container.offsetHeight === 0) {
     container.style.width = vpW + "px";
     container.style.height = vpH + "px";
   }
 
-  // CTO: 단일 진입점 — 초기 랜딩·"전체 그래프로 돌아가기" 클릭 시 동일 제한 적용 (밀집 방지)
+  //  단일 진입점 — 초기 랜딩·"전체 그래프로 돌아가기" 클릭 시 동일 제한 적용 (밀집 방지)
   let { visibleNodes, didApplyLimit } =
     isEgoMode
       ? {
@@ -2309,7 +2214,7 @@ function renderGraphWithVisJs() {
         }
       : computeVisibleNodesForRender(NODES, EDGES, activeFilters);
 
-  // QA/CTO: 검색·연관검색어 클릭 시 선택 노드가 제한(380)으로 빠지면 이름 미표시 — 선택 노드는 항상 표시 집합에 포함
+  //  검색·연관검색어 클릭 시 선택 노드가 제한(380)으로 빠지면 이름 미표시 — 선택 노드는 항상 표시 집합에 포함
   if (selectedNodeId) {
     const selectedNode = NODES.find((n) => nodeIdsEqual(n.id, selectedNodeId));
     const alreadyVisible = visibleNodes.some((n) => nodeIdsEqual(n.id, selectedNodeId));
@@ -2341,16 +2246,16 @@ function renderGraphWithVisJs() {
   const visibleEdges = EDGES.filter(
     (e) => visibleIds.has(e.from) && visibleIds.has(e.to),
   );
-  // CTO: UX 패턴 - 노드 상태에 따른 시각적 차별화 (focused/dimmed 효과)
+  //  UX 패턴 - 노드 상태에 따른 시각적 차별화 (focused/dimmed 효과)
   const visNodes = visibleNodes.map((n) => {
     const p = positions[n.id] || { x: vpW / 2, y: vpH / 2 };
     const useFixedPosition = !isEgoMode && positions[n.id];
     const color = getNodeColor(n);
     const isSelected = nodeIdsEqual(selectedNodeId, n.id);
-    // QA: 전역 변수 connectedNodeIds 사용 (설정 시 String으로 저장 — 타입 불일치 방지)
+    //  전역 변수 connectedNodeIds 사용 (설정 시 String으로 저장 — 타입 불일치 방지)
     const isConnected = selectedNodeId ? connectedNodeIds.has(String(n.id)) : false;
 
-    // CTO: 데이터 기반 동적 노드 크기 계산 (연결 수 + 지분율 + 상태)
+    //  데이터 기반 동적 노드 크기 계산 (연결 수 + 지분율 + 상태)
     const nodeSize = calculateNodeSize(
       n,
       visibleEdges,
@@ -2358,7 +2263,7 @@ function renderGraphWithVisJs() {
       connectedNodeIds,
     );
 
-    // CTO: 노드 상태별 투명도 (dimming 효과)
+    //  노드 상태별 투명도 (dimming 효과)
     let opacity = 1.0;
     if (selectedNodeId) {
       if (isSelected) {
@@ -2370,19 +2275,19 @@ function renderGraphWithVisJs() {
       }
     }
 
-    // CTO: 노드 채우기 색상 생성 (범례와 일치하도록 연한 버전)
+    //  노드 채우기 색상 생성 (범례와 일치하도록 연한 버전)
     const fillColor = getNodeFillColor(
       color,
       opacity < 1.0 ? opacity * 0.3 : 0.15,
     );
 
-    // CTO: 줌 레벨 기반 라벨 표시 — 노드 이름 일시적 비표시 이슈 완화 (getScaleSafe 단일 진입점)
+    //  줌 레벨 기반 라벨 표시 — 노드 이름 일시적 비표시 이슈 완화 (getScaleSafe 단일 진입점)
     const currentZoom = getScaleSafe(visNetwork);
-    const minZoomForLabels = 0.92; // CTO: 1.2→0.92 — 일반 줌에서도 라벨 표시, "이름 안 보임" 이슈 감소
+    const minZoomForLabels = 0.92; //  1.2→0.92 — 일반 줌에서도 라벨 표시, "이름 안 보임" 이슈 감소
     const showLabel =
       currentZoom >= minZoomForLabels || isSelected || isConnected;
 
-    // CTO: 중요도 기반 라벨 표시 (줌이 매우 낮을 때만 일부 숨김)
+    //  중요도 기반 라벨 표시 (줌이 매우 낮을 때만 일부 숨김)
     let labelText = "";
     let labelFontSize = 0;
     if (showLabel) {
@@ -2391,17 +2296,17 @@ function renderGraphWithVisJs() {
         (e) => e.from === n.id || e.to === n.id,
       );
       const degree = nodeEdges.length;
-      const isImportant = degree >= 8 || isSelected; // CTO: 10→8 — 더 많은 노드에 라벨 노출
+      const isImportant = degree >= 8 || isSelected; //  10→8 — 더 많은 노드에 라벨 노출
 
       if (currentZoom < 1.0 && !isImportant && !isSelected && !isConnected) {
-        // CTO: 1.5→1.0 — 줌 1.0 이상에서는 대부분 라벨 표시
+        //  1.5→1.0 — 줌 1.0 이상에서는 대부분 라벨 표시
         labelText = "";
         labelFontSize = 0;
       } else {
         labelFontSize = isSelected ? 14 : isImportant ? 13 : 12;
       }
     }
-    // QA: 검색/클릭 후 포커스된 노드는 항상 라벨 표시 (노드 이름 안 나오는 이슈 방지)
+    //  검색/클릭 후 포커스된 노드는 항상 라벨 표시 (노드 이름 안 나오는 이슈 방지)
     if (isSelected) {
       labelText = labelText || n.label || n.id;
       labelFontSize = Math.max(labelFontSize || 0, 12);
@@ -2415,24 +2320,24 @@ function renderGraphWithVisJs() {
       // 타 서비스 패턴 - physics 활성화 시 동적 위치 관리 (안정화 후 고정)
       // fixed 속성 제거: 초기 안정화 전에는 동적, 안정화 후에는 physics: false로 고정
       color: {
-        background: fillColor, // CTO: 채우기 색상 (범례와 일치)
+        background: fillColor, //  채우기 색상 (범례와 일치)
         border: color,
         highlight: {
           background: getNodeFillColor(color, 0.3), // 호버 시 더 진하게
           border: color,
         },
-        opacity: opacity, // CTO: 투명도 적용
+        opacity: opacity, //  투명도 적용
       },
       shape: "dot",
-      size: nodeSize, // CTO: 상태별 크기 차별화
+      size: nodeSize, //  상태별 크기 차별화
       font: {
         size: labelFontSize,
         background: labelText ? "white" : "transparent",
         strokeWidth: labelText ? 2 : 0,
         strokeColor: labelText ? "white" : "transparent",
       },
-      borderWidth: isSelected ? 3 : 2, // CTO: 선택 시 테두리 두께 증가
-      // CTO: shadow는 전역 옵션에서 설정되며, 개별 노드에서는 boolean 또는 객체로 override 가능
+      borderWidth: isSelected ? 3 : 2, //  선택 시 테두리 두께 증가
+      //  shadow는 전역 옵션에서 설정되며, 개별 노드에서는 boolean 또는 객체로 override 가능
       shadow: isSelected
         ? {
             enabled: true,
@@ -2449,7 +2354,7 @@ function renderGraphWithVisJs() {
     if (!edgeMap.has(key)) edgeMap.set(key, []);
     edgeMap.get(key).push(e);
   });
-  // CTO: UX 패턴 - 연결된 엣지만 하이라이트 (네트워크 중심 뷰)
+  //  UX 패턴 - 연결된 엣지만 하이라이트 (네트워크 중심 뷰)
   const connectedEdgeKeys = new Set();
   if (selectedNodeId) {
     visibleEdges.forEach((e) => {
@@ -2466,11 +2371,10 @@ function renderGraphWithVisJs() {
 
   const visEdges = Array.from(edgeMap.entries()).map(([key, edges]) => {
     const e = edges[0];
-    // Neo4j 전문가 관점:
-    // - 동일 from->to 사이 관계가 여러 건(리포트/기준일/주식종류 등) 존재 가능
+    //     // - 동일 from->to 사이 관계가 여러 건(리포트/기준일/주식종류 등) 존재 가능
     // - %를 합산하면 100%를 초과하기 쉬우므로, 시각화 라벨은 max(지분율) + (관계 건수)로 표현
 
-    // UX: 안전한 엣지 라벨 포맷팅 (백엔드 데이터 형식 다양성 처리)
+    // UX: 안전한 엣지 라벨 포맷팅 (서버 데이터 형식 다양성 처리)
     const edgeLabel = formatEdgeLabel(edges);
 
     // 지분율 계산 (라벨 표시 조건 확인용) - formatEdgeLabel 내부 로직 재사용
@@ -2488,7 +2392,7 @@ function renderGraphWithVisJs() {
     const maxRatio = Math.max(...ratios, 0);
     const ratio = Math.max(0, Math.min(100, maxRatio));
 
-    // CTO: 연결된 엣지만 하이라이트 (네트워크 중심 뷰)
+    //  연결된 엣지만 하이라이트 (네트워크 중심 뷰)
     const isConnected = connectedEdgeKeys.has(key);
 
     // UX: 줌 레벨 및 중요도 기반 라벨 표시 조건
@@ -2518,7 +2422,7 @@ function renderGraphWithVisJs() {
       color: {
         color: edgeColor,
         highlight: "#d85604",
-        opacity: edgeOpacity, // CTO: 투명도 적용
+        opacity: edgeOpacity, //  투명도 적용
       },
     };
   });
@@ -2527,7 +2431,7 @@ function renderGraphWithVisJs() {
     nodes: {
       font: { background: "white", strokeWidth: 2, strokeColor: "white" },
       borderWidth: 2,
-      // CTO: UX 패턴 - 그림자 효과 (별처럼 빛나는 효과)
+      //  UX 패턴 - 그림자 효과 (별처럼 빛나는 효과)
       // 전역 shadow 설정 (개별 노드에서 override 가능)
       shadow: {
         enabled: false, // 기본적으로 비활성화 (선택된 노드만 활성화)
@@ -2561,7 +2465,7 @@ function renderGraphWithVisJs() {
             fit: true,
           },
         },
-    // CTO: 그래프 DB 전문가 관점 - 인터랙션 설정 최적화
+    //   - 인터랙션 설정 최적화
     // 문제: 노드 선택 후 줌 기능이 제대로 작동하지 않음
     // 해결: 수동 휠 이벤트 처리로 스크롤과 줌 구분, 안정화 중 인터랙션 제한
     // 주의: zoomKey는 Vis.js에서 지원하지 않는 옵션이므로 제거됨
@@ -2575,11 +2479,11 @@ function renderGraphWithVisJs() {
     layout: isEgoMode
       ? { hierarchical: LAYOUT_CONFIG.ego.hierarchical }
       : { improvedLayout: false },
-    // CTO: animation은 top-level 옵션이 아님 (moveTo/fit/focus 메서드의 파라미터로만 사용)
+    //  animation은 top-level 옵션이 아님 (moveTo/fit/focus 메서드의 파라미터로만 사용)
     // 노드/엣지 상태 변경 시 부드러운 전환은 physics.enabled=false일 때 자동으로 처리됨
   };
 
-  // CTO: 타 서비스 패턴 - 안정화 완료 후 physics 비활성화
+  //  타 서비스 패턴 - 안정화 완료 후 physics 비활성화
   if (visNetwork && !visNetwork._stabilizationHandlerAdded) {
     visNetwork.on("stabilizationIterationsDone", () => {
       // 안정화 완료 후 physics 비활성화하여 위치 고정
@@ -2612,7 +2516,7 @@ function renderGraphWithVisJs() {
     visNetwork._stabilizationHandlerAdded = true;
   }
 
-  // CTO: 그래프 DB 전문가 관점 - 수동 휠 이벤트 처리 (스크롤/줌 구분)
+  //   - 수동 휠 이벤트 처리 (스크롤/줌 구분)
   // 문제: 노드 선택 후 줌 기능이 제대로 작동하지 않음
   // 해결: 컨테이너에 직접 바인딩하여 노드 선택 후에도 작동 보장
   if (visNetwork && !visNetwork._wheelHandlerAdded) {
@@ -2624,7 +2528,7 @@ function renderGraphWithVisJs() {
       container.addEventListener('wheel', (e) => {
         e.preventDefault();
         
-        // Ctrl/Cmd + 휠 = 줌 (QA: getScaleSafe로 0/NaN 방지)
+        // Ctrl/Cmd + 휠 = 줌 (getScaleSafe로 0/NaN 방지)
         if (e.ctrlKey || e.metaKey) {
           const delta = e.deltaY > 0 ? 0.9 : 1.1; // 휠 아래 = 축소, 위 = 확대
           const currentScale = getScaleSafe(visNetwork);
@@ -2642,7 +2546,7 @@ function renderGraphWithVisJs() {
         
         // 일반 휠 = 팬 (스크롤)
         // 안정화 중이면 팬 비활성화
-        // CTO: getOptions()는 Vis.js에서 지원하지 않으므로 상태 변수 사용
+        //  getOptions()는 Vis.js에서 지원하지 않으므로 상태 변수 사용
         if (physicsEnabledState) {
           return; // 안정화 중에는 팬 비활성화
         }
@@ -2666,7 +2570,7 @@ function renderGraphWithVisJs() {
     }
   }
 
-  // CTO: 줌 레벨 변경 시 라벨 표시 업데이트 (가독성 개선)
+  //  줌 레벨 변경 시 라벨 표시 업데이트 (가독성 개선)
   // 주의: renderGraph() 호출 시 physics 재활성화 방지
   if (visNetwork && !visNetwork._zoomHandlerAdded) {
     let zoomTimeout = null;
@@ -2675,11 +2579,11 @@ function renderGraphWithVisJs() {
       if (zoomTimeout) clearTimeout(zoomTimeout);
       zoomTimeout = setTimeout(() => {
         if (!visNetwork) return;
-        if (window._loadGraphRendering) return; // QA: loadGraph 진행 중엔 재렌더 생략 — "positions not initialized yet" 방지
+        if (window._loadGraphRendering) return; //  loadGraph 진행 중엔 재렌더 생략 — "positions not initialized yet" 방지
         if (!isEgoMode && Object.keys(positions).length === 0) return;
         const skipMs = (typeof UX_CONFIG !== "undefined" && UX_CONFIG.zoomHandlerSkipMsAfterSelect) || 0;
         if (skipMs > 0 && Date.now() - lastNodeSelectionTime < skipMs) return; // 노드 클릭→드래그→다른 노드 클릭 시 이중 렌더·밀집 방지
-        // QA/CTO: 줌(-)/(+) 버튼 적용 안 되는 이슈 — setData()가 뷰를 리셋하므로 복원
+        //  줌(-)/(+) 버튼 적용 안 되는 이슈 — setData()가 뷰를 리셋하므로 복원
         const savedScale = getScaleSafe(visNetwork);
         const savedPosition =
           typeof visNetwork.getViewPosition === "function"
@@ -2712,7 +2616,7 @@ function renderGraphWithVisJs() {
   }
   try {
     if (visNetwork) {
-      // CTO: 노드→다른 노드 클릭(드래그 유무 무관) 시 setData가 뷰를 리셋해 밀집처럼 보이는 것 방지 — 저장/복원
+      //  노드→다른 노드 클릭(드래그 유무 무관) 시 setData가 뷰를 리셋해 밀집처럼 보이는 것 방지 — 저장/복원
       const preserveView = !window._loadGraphRendering;
       let savedScale = null;
       let savedPosition = null;
@@ -2722,9 +2626,9 @@ function renderGraphWithVisJs() {
           savedPosition = visNetwork.getViewPosition();
         }
       }
-      // QA: 기존 인스턴스 업데이트
+      //  기존 인스턴스 업데이트
       visNetwork.setData(data);
-      // CTO: 노드 클릭 시 physics 재활성화 방지 — 포커스 유지·화면 유동성 제거 (확장성·유지보수)
+      //  노드 클릭 시 physics 재활성화 방지 — 포커스 유지·화면 유동성 제거)
       const opts =
         !isEgoMode && !physicsEnabledState
           ? { ...options, physics: false }
@@ -2734,14 +2638,14 @@ function renderGraphWithVisJs() {
         physicsEnabledState = false;
         return;
       }
-      // QA: loadGraph(초기 랜딩·전체 그래프 복귀) 후 렌더 시 physics 재활성화 억제 — 밀집 재현 방지
+      //  loadGraph(초기 랜딩·전체 그래프 복귀) 후 렌더 시 physics 재활성화 억제 — 밀집 재현 방지
       if (window._loadGraphRendering) {
         visNetwork.setOptions({ physics: false });
         physicsEnabledState = false;
         window._loadGraphRendering = false;
         return;
       }
-      // CTO: 빈 공간 클릭 시 physics 재활성화 방지 — 이미 안정된 레이아웃이 한 덩어리로 붙는 이슈 해결
+      //  빈 공간 클릭 시 physics 재활성화 방지 — 이미 안정된 레이아웃이 한 덩어리로 붙는 이슈 해결
       const shouldReenablePhysics =
         !selectedNodeId && physicsEnabledState;
       if (shouldReenablePhysics) {
@@ -2759,7 +2663,7 @@ function renderGraphWithVisJs() {
         });
       }
     } else {
-      // QA: 새 인스턴스 생성 (이벤트 리스너는 setupVisNetworkEvents에서 한 번만 등록)
+      //  새 인스턴스 생성 (이벤트 리스너는 setupVisNetworkEvents에서 한 번만 등록)
       visNetwork = new vis.Network(container, data, options);
       physicsEnabledState = true; // 초기 상태는 physics 활성화 (options에서 physics: true)
       setupVisNetworkEvents(visNetwork);
@@ -2774,7 +2678,7 @@ function renderGraphWithVisJs() {
     });
     updateStatus("그래프 렌더링 실패 - 페이지를 새로고침해주세요", false);
     hideGraphLoading();
-    // QA: 에러 발생 시 인스턴스 초기화 (재시도 가능하도록)
+    //  에러 발생 시 인스턴스 초기화 (재시도 가능하도록)
     visNetwork = null;
     visNetworkEventsSetup = false;
   }
@@ -2792,7 +2696,7 @@ function renderGraph() {
   renderGraphWithVisJs();
 }
 
-// CTO: Vis.js 단일 체제 - 줌 기능을 Vis.js Network API로 연결
+//  Vis.js 단일 체제 - 줌 기능을 Vis.js Network API로 연결
 function setupZoomControls() {
   const zoomInBtn = document.getElementById("zoomIn");
   const zoomOutBtn = document.getElementById("zoomOut");
@@ -2847,12 +2751,12 @@ function setupZoomControls() {
 
   if (resetViewBtn) {
     resetViewBtn.onclick = () => {
-      // CTO: ego 모드면 로고 클릭과 동일하게 전체 그래프로 복귀 (일관된 “초기화” 동작)
+      //  ego 모드면 로고 클릭과 동일하게 전체 그래프로 복귀 (일관된 “초기화” 동작)
       if (isEgoMode) {
         resetToHome();
         return;
       }
-      // QA: 비-ego 시 재렌더 없이 선택 해제·뷰 fit만 적용 — 초기화 클릭 후 밀집 재현 방지
+      //  비-ego 시 재렌더 없이 선택 해제·뷰 fit만 적용 — 초기화 클릭 후 밀집 재현 방지
       selectedNode = null;
       selectedNodeId = null;
       connectedNodeIds.clear();
@@ -2896,7 +2800,7 @@ function showTooltip(n, e) {
     (e) => (e.from === n.id || e.to === n.id) && e.ratio,
   )?.ratio;
   const ratioStr = formatRatio(ratio) !== "" ? ` · ${formatRatio(ratio)}%` : "";
-  // CTO: UX 개선 - 타 서비스 CSS와 호환 (opacity + visible 클래스)
+  //  UX 개선 - 타 서비스 CSS와 호환 (opacity + visible 클래스)
   tooltip.innerHTML = `<span class="tt-name">${esc(n.label)}</span><span class="tt-type">${esc(n.sub)}${ratioStr} · 연결 ${related.length}개</span>`;
   tooltip.classList.add("visible");
   moveTooltip(e);
@@ -2909,7 +2813,7 @@ function moveTooltip(e) {
   tooltip.style.left = tx + "px";
   tooltip.style.top = ty + "px";
 }
-// CTO: UX 개선 - opacity 기반 전환 효과 (display 대신)
+//  UX 개선 - opacity 기반 전환 효과 (display 대신)
 function hideTooltip() {
   if (tooltip) {
     tooltip.classList.remove("visible");
@@ -2917,7 +2821,7 @@ function hideTooltip() {
   }
 }
 
-// CTO: 노드 포커스(줌/패닝) 공통 로직 — 노드 클릭·검색 선택 시 재사용 (유지보수성·일관성)
+//  노드 포커스(줌/패닝) 공통 로직 — 노드 클릭·검색 선택 시 재사용 (유지보수성·일관성)
 function focusOnNode(nodeId) {
   if (!visNetwork || !nodeId) return;
   const run = () => {
@@ -2946,7 +2850,7 @@ async function selectNode(n) {
   selectedNodeId = n.id;
   lastNodeSelectionTime = Date.now();
 
-  // CTO: 다른 노드 클릭 시 항상 '노드 상세' 탭으로 전환 — AI 질문 탭에 있을 때도 상세가 바로 보이도록
+  //  다른 노드 클릭 시 항상 '노드 상세' 탭으로 전환 — AI 질문 탭에 있을 때도 상세가 바로 보이도록
   switchTabById("detail");
 
   if (visNetwork) {
@@ -2972,16 +2876,16 @@ async function selectNode(n) {
   const detailPromise = loadNodeDetail(n.id);
   requestAnimationFrame(() => {
     renderGraph();
-    // CTO: renderGraph 직후 포커스 — 노드 포커스 안 됨·화면 유동적 이슈 방지 (physics 유지 후 뷰 이동)
+    //  renderGraph 직후 포커스 — 노드 포커스 안 됨·화면 유동적 이슈 방지 (physics 유지 후 뷰 이동)
     setTimeout(() => focusOnNode(n.id), 60);
   });
   const detail = await detailPromise;
-  // QA/CTO: 노드 클릭 → 드래그(패닝) → 다른 노드 클릭 시 이전 노드 상세가 늦게 도착해 패널 덮어쓰는 것 방지
+  //  노드 클릭 → 드래그(패닝) → 다른 노드 클릭 시 이전 노드 상세가 늦게 도착해 패널 덮어쓰는 것 방지
   if (detail && nodeIdsEqual(selectedNodeId, requestedNodeId)) renderNodeDetail(detail);
   else if (!detail) updateNodeDetailLoadingMessage(LOADING_MESSAGES.nodeDetailLoadError);
 }
 
-// CTO: 진행도 메시지 갱신 — 백엔드 진행 이벤트 추가 시 여기만 확장 (확장성·유지보수)
+//  진행도 메시지 갱신 — 서버 진행 이벤트 추가 시 여기만 확장)
 function updateNodeDetailLoadingMessage(message) {
   const el = document.getElementById("nodeDetailLoadingHint");
   if (!el) return;
@@ -3135,7 +3039,7 @@ async function renderNodeDetail(data) {
       <div class="nd-section-title">${UI_STRINGS.nodeDetail.sectionAttrs}</div>
       <div class="props-grid">
         ${(() => {
-          // CTO: 노드 타입별 속성 필터링 및 중복 제거
+          //  노드 타입별 속성 필터링 및 중복 제거
           const hiddenProps = [
             "createdAt",
             "created_at",
@@ -3252,7 +3156,7 @@ function selectNodeById(id) {
   if (n) selectNode(n);
 }
 
-// CTO: 연결 노드 더보기 토글 (UX 개선)
+//  연결 노드 더보기 토글 (UX 개선)
 function toggleRelatedMore() {
   const moreEl = document.getElementById("relatedMore");
   const btn =
@@ -3293,7 +3197,7 @@ function showEmptyPanel(skipRenderGraph = false) {
   document.getElementById("panelEmpty").style.display = "";
   document.getElementById("nodeDetail").classList.remove("visible");
   document.getElementById("nodeDetail").innerHTML = "";
-  // CTO: UX 패턴 - 선택 해제 시 dimming 효과 제거
+  //  UX 패턴 - 선택 해제 시 dimming 효과 제거
   selectedNodeId = null;
   connectedNodeIds.clear();
   if (visNetwork) {
@@ -3307,12 +3211,12 @@ function showEmptyPanel(skipRenderGraph = false) {
 ═══════════════════════════════════════════ */
 // UX: AI 질문 탭 기본 프롬프트/제안 (노드 미선택 시) — 일관성·유지보수용 단일 소스
 const CHAT_DEFAULT_PLACEHOLDER = "자연어로 질문하세요 (예: 지분율 50% 이상 최대주주)";
-// CTO: 컨텍스트 있을 때 문구 단일 소스 — 중복 제거·확장성
+//  컨텍스트 있을 때 문구 단일 소스 — 중복 제거·확장성
 const CHAT_CONTEXT_PLACEHOLDER_TEMPLATE = (label) => `"${label}"에 대해 질문하세요...`;
 const CHAT_CONTEXT_SUG_HEADER = "다음 질문을 선택하세요";
 const CHAT_CONTEXT_SWITCHED_TEMPLATE = (label) => `컨텍스트가 ${label}로 변경되었습니다. 아래 대화는 이전 노드 기준일 수 있습니다.`;
 
-// CTO: AI 질문 예시 단일 소스 — 확장·유지보수·협업 (배열만 수정하면 HTML/렌더 동기화)
+//  AI 질문 예시 단일 소스 — 확장·유지보수·협업 (배열만 수정하면 HTML/렌더 동기화)
 const CHAT_DEFAULT_SUGGESTIONS = [
   { q: "지분율 50% 이상인 최대주주 목록을 보여줘", label: "지분율 50% 이상 최대주주 목록" },
   { q: "우선주 보유 비중이 높은 회사 TOP 10을 보여줘", label: "우선주 보유 비중이 높은 회사 TOP 10" },
@@ -3388,7 +3292,7 @@ function syncChatTabUI() {
   }
 }
 
-// CTO: 컨텍스트 전환 시 시스템 메시지로 혼동 방지 (S4), 단일 진입점으로 확장·협업 유지
+//  컨텍스트 전환 시 시스템 메시지로 혼동 방지 (S4), 단일 진입점으로 확장·협업 유지
 function openChatWithContext(nodeId, label, type) {
   const wasDifferentContext = chatContext && chatContext.nodeId !== nodeId;
   const previousLabel = chatContext?.label;
@@ -3416,7 +3320,7 @@ function clearContext() {
   syncChatTabUI();
 }
 
-// CTO: 대화 이력 초기화 (컨텍스트 초과 에러 해결을 위한 명확한 UX)
+//  대화 이력 초기화 (컨텍스트 초과 에러 해결을 위한 명확한 UX)
 async function resetChatHistory() {
   if (
     !confirm(
@@ -3589,7 +3493,7 @@ function handleSend() {
 
 document.getElementById("chatSend").addEventListener("click", handleSend);
 
-// CTO: 대화 초기화 버튼 이벤트
+//  대화 초기화 버튼 이벤트
 const chatResetBtn = document.getElementById("chatResetBtn");
 if (chatResetBtn) {
   chatResetBtn.addEventListener("click", resetChatHistory);
@@ -3694,11 +3598,11 @@ async function toggleFilter(el) {
     pill.classList.add("active");
   }
 
-  // QA: 필터 변경 시 모든 활성 필터 노드 표시 (노드 타입 정규화로 API 대소문자 차이 흡수)
+  //  필터 변경 시 모든 활성 필터 노드 표시 (노드 타입 정규화로 API 대소문자 차이 흡수)
   const visibleNodes = NODES.filter((n) =>
     activeFilters.has(canonicalNodeType(n.type)),
   );
-  // CTO: 개발 환경에서만 필터 변경 로그 출력
+  //  개발 환경에서만 필터 변경 로그 출력
   const isDevelopment =
     window.location.hostname === "localhost" ||
     window.location.hostname === "127.0.0.1" ||
@@ -3727,10 +3631,10 @@ async function toggleFilter(el) {
   connectedNodeIds.clear();
   if (visNetwork) visNetwork.unselectAll();
 
-  // CTO: 필터 on/off 시 밀집 방지 — physics 재활성화 제거, initPositions 후 1회만 렌더
+  //  필터 on/off 시 밀집 방지 — physics 재활성화 제거, initPositions 후 1회만 렌더
   if (!isEgoMode) await initPositions();
   renderGraph();
-  showEmptyPanel(true); // QA: 이중 렌더 방지 (위 renderGraph만 사용)
+  showEmptyPanel(true); //  이중 렌더 방지 (위 renderGraph만 사용)
   if (visNetwork) {
     setTimeout(() => visNetwork.fit({ animation: { duration: 300 } }), 100);
   }
@@ -3742,13 +3646,13 @@ async function toggleFilter(el) {
 let searchTimeout = null;
 let searchResults = [];
 let selectedSearchIndex = -1;
-// CTO: 지배구조 맵(ego) 시 검색 결과가 서버 API 기준이면 true — 클릭 시 해당 노드 ego로 전환
+//  지배구조 맵(ego) 시 검색 결과가 서버 API 기준이면 true — 클릭 시 해당 노드 ego로 전환
 let searchResultsFromApi = false;
 
 const SEARCH_SUGGESTION_LIMIT = 10;
 const SEARCH_API_LIMIT = 15;
 
-// CTO: 서버 검색 단일 진입점 — 홈/지배구조 맵(ego) 공통, 확장성·유지보수
+//  서버 검색 단일 진입점 — 홈/지배구조 맵(ego) 공통, 확장성·유지보수
 function searchViaApi(q) {
   searchResultsFromApi = true;
   showSearchLoading();
@@ -3783,7 +3687,7 @@ function performSearch(query) {
   selectedSearchIndex = -1;
   const qLower = q.toLowerCase();
 
-  // CTO: 지배구조 맵(ego) 또는 홈에서 로컬 데이터 없음/매칭 없음 → 서버 검색 (홈/노드 클릭 시 검색 안 되는 이슈 대응)
+  //  지배구조 맵(ego) 또는 홈에서 로컬 데이터 없음/매칭 없음 → 서버 검색 (홈/노드 클릭 시 검색 안 되는 이슈 대응)
   const useApiOnly = isEgoMode;
   const noLocalData = NODES.length === 0;
   const localResults = noLocalData
@@ -3986,7 +3890,7 @@ function esc(s) {
   return div.innerHTML;
 }
 
-// CTO: AI 답변용 — esc 후 **...** 만 <strong>으로 렌더 (XSS 방지 유지, 확장 시 서브셋 추가 가능)
+//  AI 답변용 — esc 후 **...** 만 <strong>으로 렌더 (XSS 방지 유지, 확장 시 서브셋 추가 가능)
 function renderChatAnswer(text) {
   if (text == null || text === "") return "";
   const escaped = esc(text);
@@ -3996,10 +3900,10 @@ function renderChatAnswer(text) {
 /* ═══════════════════════════════════════════
    INIT
 ═══════════════════════════════════════════ */
-// QA: resize 이벤트 최적화 - Vis.js가 자동으로 처리하므로 불필요한 initPositions 제거
+//  resize 이벤트 최적화 - Vis.js가 자동으로 처리하므로 불필요한 initPositions 제거
 window.addEventListener("resize", () => {
   if (visNetwork) {
-    // QA: Vis.js가 자동으로 리사이즈 처리, redraw()로 강제 갱신
+    //  Vis.js가 자동으로 리사이즈 처리, redraw()로 강제 갱신
     try {
       visNetwork.redraw();
     } catch (e) {
@@ -4010,7 +3914,7 @@ window.addEventListener("resize", () => {
   }
 });
 
-// UX: 로고(금융회사지배구조) 클릭 시 홈으로 이동 — CTO: ego 모드면 전체 그래프 재로드 후 fit
+// 로고 클릭 시 홈. ego 모드면 전체 그래프 재로드 후 fit
 function resetToHome() {
   const searchInput = document.getElementById("nodeSearch");
   if (searchInput) {
@@ -4028,7 +3932,7 @@ function resetToHome() {
     pill.classList.add("active");
   });
 
-  // CTO: 지배구조 맵(ego) 보기 후 로고 클릭 시 전체 그래프로 복귀
+  //  지배구조 맵(ego) 보기 후 로고 클릭 시 전체 그래프로 복귀
   if (isEgoMode) {
     isEgoMode = false;
     egoCenterId = null;
@@ -4056,7 +3960,7 @@ function resetToHome() {
     return;
   }
 
-  // CTO: 비-ego 시 저장된 positions로 레이아웃 재적용 후 fit — 로고 클릭 후 밀집 상태 복구 (일관성·확장성)
+  //  비-ego 시 저장된 positions로 레이아웃 재적용 후 fit — 로고 클릭 후 밀집 상태 복구 (일관성·확장성)
   if (visNetwork && NODES.length > 0 && Object.keys(positions).length > 0) {
     visNetwork.unselectAll();
     clearSelectionVisualState(visNetwork);
@@ -4087,7 +3991,7 @@ function resetToHome() {
   updateStatus("홈으로 이동했습니다", true);
 }
 
-// CTO: 범례/노드 유형 라벨을 UI_STRINGS와 동기화 (단일 소스, 하드코딩 제거)
+//  범례/노드 유형 라벨을 UI_STRINGS와 동기화 (단일 소스, 하드코딩 제거)
 function syncLegendLabels() {
   const titleEl = document.querySelector(".legend-title");
   if (titleEl) titleEl.textContent = UI_STRINGS.legend.title;
@@ -4098,7 +4002,7 @@ function syncLegendLabels() {
   });
 }
 
-// CTO: 탭·필터·빈 패널·지배구조 맵 버튼 문구를 UI_STRINGS와 동기화 (확장성·유지보수·협업)
+//  탭·필터·빈 패널·지배구조 맵 버튼 문구를 UI_STRINGS와 동기화·협업)
 function syncPanelTabLabels() {
   document.querySelectorAll(".ptab[data-tab]").forEach((el) => {
     const key = el.getAttribute("data-tab");
@@ -4135,7 +4039,7 @@ function syncEgoBannerButtonLabels() {
   if (labelEl) labelEl.textContent = UI_STRINGS.govMap.label;
 }
 
-// CTO: 모든 UI 문구를 UI_STRINGS와 동기화 (탭·필터·범례·빈 패널·지배구조 맵)
+//  모든 UI 문구를 UI_STRINGS와 동기화 (탭·필터·범례·빈 패널·지배구조 맵)
 function syncAllUILabels() {
   syncLegendLabels();
   syncPanelTabLabels();
@@ -4144,7 +4048,7 @@ function syncAllUILabels() {
   syncEgoBannerButtonLabels();
 }
 
-// CTO: Vis.js 라이브러리 로드 확인 후 loadGraph 실행 (초기화)
+//  Vis.js 라이브러리 로드 확인 후 loadGraph 실행 (초기화)
 function waitForVisJs(maxAttempts = 20, interval = 100) {
   if (typeof vis !== "undefined" && vis.Network) {
     syncAllUILabels();

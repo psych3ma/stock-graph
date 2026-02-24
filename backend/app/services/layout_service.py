@@ -97,7 +97,7 @@ def _layout_with_pygraphviz(
         return {list(G.nodes())[0]: (0.0, 0.0)}
     try:
         A = to_agraph(G)
-        # CTO 전략: neato 엔진 + overlap=false (결정론적) + sep=+20 (라벨 겹침 방지 강화)
+        # neato + overlap=false (결정론적) + sep=+20 (라벨 겹침 방지)
         A.graph_attr.update(overlap="false", splines="true", sep="+20")
         A.layout(prog="neato")
         pos = {}

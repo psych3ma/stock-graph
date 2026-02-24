@@ -4,7 +4,7 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>금융회사지배구조 · 주주 네트워크 탐색</title>
-<!-- CTO: Favicon 추가 (404 에러 방지, 브랜딩 일관성) -->
+<!-- Favicon (404 방지, 브랜딩) -->
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='%23d85604'/><path d='M30 50 L45 35 L45 45 L70 45 L70 55 L45 55 L45 65 Z' fill='white'/></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet"/>
@@ -89,7 +89,6 @@
   <!-- GRAPH -->
   <!-- ═══════════════════════════════════════════════════════════════════════════
        GRAPH AREA (Vis.js 기반, 접근성 강화)
-       CTO: 확장성/유지보수성/일관성/호환성/협업 코드 고려
        - role="main": 메인 콘텐츠 영역 명시
        - aria-label: 스크린 리더 지원
        - data-wheel-bound: 휠 이벤트 바인딩 플래그
@@ -97,7 +96,7 @@
   <div class="graph-area" id="graphArea" role="main" aria-label="그래프 시각화 영역" data-wheel-bound="1">
     
     <!-- ═════════════════ LOADING OVERLAY (Unified Variant) ═════════════════ -->
-    <!-- CTO: 단계별 진행률 표시, 프로그레스바, 단계 인디케이터 포함 -->
+    <!-- 로딩: 단계별 진행률, 프로그레스바 -->
     <div class="loading-overlay variant-unified hidden has-progress" id="loadingOverlay" aria-live="polite" aria-busy="false">
       <div class="loading-spinner"></div>
       <div class="loading-message-wrap">
@@ -131,7 +130,7 @@
     <div id="egoHeatmapWrap" class="ego-heatmap-wrap util-hidden" aria-label="가중치 엣지 히트맵"></div>
     
     <!-- ═════════════════ TOOLTIP ═════════════════ -->
-    <!-- CTO: ID 변경 (tooltip → graphTooltip), role="tooltip" 추가 -->
+    <!-- 툴팁: id=graphTooltip, role=tooltip -->
     <div id="graphTooltip" role="tooltip" aria-hidden="true"></div>
 
     <!-- ═════════════════ GRAPH STATISTICS ═════════════════ -->
@@ -139,7 +138,7 @@
     <div class="graph-stats" id="graphStats" aria-label="그래프 통계"></div>
 
     <!-- ═════════════════ ZOOM CONTROLS ═════════════════ -->
-    <!-- CTO: 접근성 강화 (role="group", aria-label 추가) -->
+    <!-- 접근성: role=group, aria-label -->
     <div class="zoom-controls" role="group" aria-label="줌 컨트롤">
       <button class="zoom-btn" id="zoomIn" title="확대">+</button>
       <button class="zoom-btn" id="zoomOut" title="축소">−</button>
@@ -147,7 +146,7 @@
     </div>
 
     <!-- ═════════════════ GRAPH LEGEND ═════════════════ -->
-    <!-- CTO: ID 추가 (id="legend"), 접근성 강화 (role="group", aria-label) -->
+    <!-- 범례: id=legend, role=group -->
     <div class="graph-legend" id="legend" role="group" aria-label="노드 타입 범례">
       <div class="legend-title">노드 유형</div>
       <div class="legend-row" data-count-type="company">
@@ -240,7 +239,7 @@
             <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 10V3a1 1 0 011-1h7a1 1 0 011 1v5a1 1 0 01-1 1H4L2 10z" stroke="white" stroke-width="1.3" stroke-linejoin="round"/></svg>
           </button>
         </div>
-        <!-- CTO: 대화 초기화 버튼 (컨텍스트 초과 에러 해결을 위한 명확한 UX) -->
+        <!-- 대화 초기화 (컨텍스트 초과 시) -->
         <button class="chat-reset-btn" id="chatResetBtn" title="대화 이력 초기화">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
             <path d="M6 2v3l2-2M6 5l-2-2M2 6a4 4 0 1 1 8 0" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>

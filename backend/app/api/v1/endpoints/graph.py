@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/graph", tags=["graph"])
 
-# 노드 상세 응답 캐시 (TTL). 협업: 동일 노드 재클릭 시 백엔드 부하 감소
+# 노드 상세 응답 캐시 (TTL). 동일 노드 재클릭 시 부하 감소
 _NODE_DETAIL_CACHE: dict[str, tuple[float, Any]] = {}
 NODE_DETAIL_CACHE_TTL_SEC = 60
 _node_detail_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="node_detail")
@@ -129,7 +129,7 @@ def get_nodes(
         else:
             # 기존 로직: node_ids가 없을 때는 레이블별로 조회
             # 1) Company nodes
-            # CTO: 텍스트 인덱스 활용 (Neo4j 5.x+), 없으면 CONTAINS로 폴백
+            # 텍스트 인덱스(Neo4j 5.x+) 활용, 없으면 CONTAINS 폴백
             if nt in (None, "company"):
                 if sanitized_search:
                     # 텍스트 인덱스 사용 시도 (Neo4j 5.x+)
@@ -181,7 +181,7 @@ def get_nodes(
                 )
 
             # 2) Stockholder nodes (Person/Company, plus MajorShareholder label if present)
-            # CTO: 텍스트 인덱스 활용, 없으면 CONTAINS로 폴백
+            # 텍스트 인덱스 활용, 없으면 CONTAINS 폴백
             if nt in (None, "person", "major", "institution"):
                 if sanitized_search:
                     # 텍스트 인덱스 사용 시도
@@ -343,10 +343,7 @@ def get_edges(
     if node_ids:
         ids = [_neo4j_id(x.strip()) for x in node_ids.split(",") if x.strip()]
 
-    # Neo4j 전문가 관점:
-    # - 동일 (s)->(c) 관계가 reportYear/baseDate 등으로 여러 건 존재할 수 있음
-    # - 프론트에서 합산(sum)하면 100%를 쉽게 초과하므로, 여기서 (from,to) 단위로 집계해 반환
-    # - ratio는 max(r.stockRatio), count는 관계 건수
+    # (from,to) 단위 집계. ratio=max(stockRatio), count=관계 건수.
     query = """
         MATCH (s:Stockholder)-[r:HOLDS_SHARES]->(c:Company)
         WHERE ($ids IS NULL OR id(s) IN $ids OR id(c) IN $ids)
@@ -599,7 +596,7 @@ def get_ego_graph(
     # 해결: max_hops 값에 따라 쿼리를 동적으로 생성 (1~3 홉만 허용)
     max_hops_clamped = max(1, min(3, max_hops))
     
-    # CTO: 관계 패턴 길이는 리터럴 값만 허용되므로 동적 쿼리 생성 필요
+    # 관계 패턴 길이는 리터럴만 허용, 동적 쿼리 생성
     # 보안: max_hops_clamped는 이미 1~3 범위로 제한되어 있음
     nodes_query = f"""
         MATCH (ego)

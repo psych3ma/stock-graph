@@ -1,13 +1,14 @@
 /* ═══════════════════════════════════════════════════════════════════════════
    FILE STRUCTURE (협업용)
-   1) CONFIG  - API_BASE, GRAPH_CONFIG, LAYOUT_CONFIG, NODE_COLORS, NODE_RADIUS
-   2) STATE   - NODES, EDGES, positions, selectedNode, isEgoMode, ...
-   3) API     - apiCall, loadGraph, loadEgoGraph, loadNodeDetail
-   4) LAYOUT  - computeHierarchicalLayout, initPositions
-   5) RENDER  - renderGraph, 노드/엣지 SVG 생성
-   6) PANEL   - selectNode, renderNodeDetail, showEmptyPanel
-   7) CHAT    - sendChatMessage, openChatWithContext, 메시지 렌더
-   8) INIT    - 이벤트 바인딩, loadGraph() 호출
+   1) CONFIG   - API_BASE, GRAPH_CONFIG, LAYOUT_CONFIG, NODE_COLORS
+   2) STATE    - NODES, EDGES, positions, selectedNode, isEgoMode, egoMapViewMode
+   3) API      - apiCall, loadGraph, loadEgoGraph, loadNodeDetail
+   4) LAYOUT   - computeHierarchicalLayout, initPositions
+   5) GOVERNANCE MAP - buildWeightedEdgeMatrix, renderWeightedEdgeHeatmap, setGovernanceMapViewMode
+   6) RENDER   - renderGraph, renderGraphWithVisJs
+   7) PANEL    - selectNode, renderNodeDetail, renderNodeDetailFallback, showEmptyPanel
+   8) CHAT     - sendChatMessage, openChatWithContext
+   9) INIT     - 이벤트 바인딩, loadGraph() 호출
 ══════════════════════════════════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════
@@ -31,6 +32,7 @@ const GRAPH_CONFIG = {
   minRatio: 5, // 초기 로딩 시 N% 미만 지분 관계 제외 (Cypher 가지치기, 노이즈·뭉침 감소)
   useServerLayout: true, // 서버 레이아웃 API 사용 (협업: 백엔드 단일 소스), 실패 시 클라이언트 force로 폴백
   layoutEngine: "pygraphviz", // PyGraphviz (neato 엔진, 결정론적 레이아웃), 실패 시 NetworkX 폴백
+  openEgoOnNodeClick: false, // CTO: 노드 클릭 시 포커스+상세만 (true면 지배구조 맵 로딩 전체 화면 표시 → UX 이슈)
 };
 
 // P2: 운영 설정 상수화 (타임아웃, API 제한 등)
@@ -39,10 +41,70 @@ const API_CONFIG = {
   retryDelay: 1000, // 재시도 지연 (ms)
 };
 
+// CTO: UX 동작 상수 — 노드 클릭→드래그→다른 노드 클릭 시 밀집·홈 복귀 시 레이아웃 복구 (하드코딩 제거)
+const UX_CONFIG = {
+  zoomHandlerSkipMsAfterSelect: 400, // 노드 선택 직후 이 시간(ms) 동안은 zoom 핸들러에서 renderGraph 스킵 (이중 렌더·밀집 방지)
+};
+
 // CTO: Ego 그래프 설정 상수화 (하드코딩 제거)
+/** 노드 상세 패널 연결 노드 표시 상한 (백엔드 LIMIT 20과 동일, UX 안내용) */
+const NODE_DETAIL_RELATED_MAX = 20;
+
 const EGO_GRAPH_CONFIG = {
   MAX_HOPS: 2,
   MAX_NODES: 120,
+  // UX CTO: 지배구조 맵 보기와 포커스 차별화 — 'fit'이면 전체 ego 그래프를 뷰에 맞춤, 'focus'면 해당 노드에 줌
+  initialViewAfterLoad: "fit",
+};
+
+// CTO: UI 문구 단일 소스 — 하드코딩 제거, 확장성·유지보수·협업 (i18n 준비)
+const UI_STRINGS = {
+  nodeType: {
+    company: "회사",
+    person: "개인주주",
+    major: "최대주주",
+    institution: "기관",
+  },
+  heatmap: {
+    title: "가중치 엣지 히트맵 (지분율 %)",
+    sub: "행 → 열: 주주 → 회사 지분",
+    ariaLabel: "지분율 행렬",
+  },
+  govMap: {
+    label: "지배구조 맵",
+    viewHeatmap: "지배구조 맵 (가중치 히트맵)",
+    viewEgo: "지배구조 맵 · Ego", // CTO: 한 줄 가독성, "(Ego-Graph)" 줄바꿈 방지
+    btnHeatmap: "히트맵",
+    btnEgo: "Ego 그래프",
+    btnExit: "전체 그래프로 돌아가기",
+    titleHeatmap: "가중치(지분율) 행렬로 보기",
+    titleEgo: "노드-링크 그래프로 보기",
+    statusEgoLoaded: "이 노드 기준 지배구조 맵을 표시합니다",
+  },
+  nodeDetail: {
+    sectionRelated: "연결 노드",
+    sectionAttrs: "속성",
+    more: "더보기",
+    fold: "접기",
+    btnEgoMap: "이 노드 기준 지배구조 맵 보기",
+    btnAskAi: "이 노드에 대해 AI에게 질문하기",
+  },
+  legend: {
+    title: "노드 유형",
+    countSuffix: " 건",
+  },
+  filter: {
+    minOneType: "최소 하나의 노드 타입을 선택해주세요",
+  },
+  tabs: {
+    detail: "노드 상세",
+    chat: "AI 질문",
+  },
+  panelEmpty: {
+    title: "그래프에서 노드를 클릭하면",
+    titleBr: "상세 정보를 확인할 수 있습니다",
+    hint: "노드를 드래그하여 그래프를 탐색하세요",
+  },
 };
 
 // CTO: 에러 메시지 상수화 (하드코딩 제거, 다국어 지원 준비)
@@ -58,14 +120,63 @@ const ERROR_MESSAGES = {
 // 레이아웃 정책 (협업 문서): ratio(지분%) → 시각적 거리. "높은 지분 = 가까이"로 통일.
 // - 서버(NetworkX): spring_layout weight=ratio. - 클라이언트(force): idealDist ∝ 1/√ratio (useInverseSqrtEdgeLength).
 // Force Simulation — CTO: 초기 배치 + 물리 엔진이 실시간으로 퍼뜨려야 "별자리" 가능. 격자/기본값만 쓰면 4군데 뭉침.
-// CTO: 초기 뷰 제한 설정 (대량 노드 환경 가독성 개선)
+// CTO: 초기 뷰 제한 설정 (대량 노드 환경 가독성·밀집 방지 — 그래프가 한 덩어리로 보이는 현상 완화)
 const INITIAL_VIEW_CONFIG = {
-  enabled: true, // 초기 뷰 제한 활성화
-  minConnections: 3, // 최소 연결 수
-  minRatio: 5, // 최소 지분율 (%)
-  showTypes: ["company", "major", "institution"], // 표시할 노드 타입 (개인주주 제외)
-  maxNodes: 1000, // 최대 표시 노드 수
+  enabled: true,
+  applyWhenOver: 280, // 이 개수 초과 시 제한 적용 (기존 maxNodes만 사용 시 500노드 로드 시 미적용 이슈)
+  minConnections: 3,
+  minRatio: 5,
+  showTypes: ["company", "major", "institution"], // 개인주주(person) 제외 시 밀집 대폭 감소
+  maxNodes: 380, // 최대 표시 노드 수 (1000→380, 확장성·유지보수: 상수만 조정)
 };
+
+/**
+ * CTO: 단일 소스 — 초기 뷰/전체 그래프 표시 노드 제한 (확장성·유지보수·협업).
+ * 초기 랜딩·"전체 그래프로 돌아가기" 클릭 시 동일 경로에서 호출되어 밀집 방지.
+ * @param {Array} nodes - 필터 적용 전 노드 배열 (NODES)
+ * @param {Array} edges - 엣지 배열 (EDGES)
+ * @param {Set} typeFilterSet - 활성 노드 타입 (activeFilters)
+ * @returns {{ visibleNodes: Array, didApplyLimit: boolean }}
+ */
+function computeVisibleNodesForRender(nodes, edges, typeFilterSet) {
+  const visible = (nodes || []).filter(
+    (n) => n && typeFilterSet.has(canonicalNodeType(n.type)),
+  );
+  const threshold = INITIAL_VIEW_CONFIG.applyWhenOver ?? INITIAL_VIEW_CONFIG.maxNodes;
+  const applyLimit =
+    INITIAL_VIEW_CONFIG.enabled && visible.length > threshold;
+  if (!applyLimit) return { visibleNodes: visible, didApplyLimit: false };
+
+  const filtered = visible.filter((n) => {
+    const ct = canonicalNodeType(n.type);
+    if (!INITIAL_VIEW_CONFIG.showTypes.includes(ct)) return false;
+    const nodeEdges = (edges || []).filter((e) => e.from === n.id || e.to === n.id);
+    const degree = nodeEdges.length;
+    const maxRatio = Math.max(...nodeEdges.map((e) => Number(e.ratio || 0)), 0);
+    if (degree < INITIAL_VIEW_CONFIG.minConnections) return false;
+    if (maxRatio < INITIAL_VIEW_CONFIG.minRatio && ct === "person") return false;
+    return true;
+  });
+
+  const cap = INITIAL_VIEW_CONFIG.maxNodes;
+  if (filtered.length <= cap) return { visibleNodes: filtered, didApplyLimit: true };
+  const limited = filtered
+    .map((n) => {
+      const nodeEdges = (edges || []).filter((e) => e.from === n.id || e.to === n.id);
+      const degree = nodeEdges.length;
+      const maxRatio = Math.max(...nodeEdges.map((e) => Number(e.ratio || 0)), 0);
+      return { node: n, importance: degree * 0.1 + maxRatio * 0.05 };
+    })
+    .sort((a, b) => b.importance - a.importance)
+    .slice(0, cap)
+    .map((item) => item.node);
+  return { visibleNodes: limited, didApplyLimit: true };
+}
+
+/** CTO: API/백엔드와 필터 일관성 — 노드 타입 대소문자 정규화 (필터 미적용 이슈 방지). 단일 진입점. */
+function canonicalNodeType(t) {
+  return (t && String(t).toLowerCase()) || "";
+}
 
 const LAYOUT_CONFIG = {
   force: {
@@ -82,7 +193,7 @@ const LAYOUT_CONFIG = {
     idealDistBaseLengthForInverseSqrt: 2000,
     repulsionDegreeFactor: 0.5,
     edgeForce: 0.022, // 약화: 링크가 컴포넌트 중심으로 당기는 힘 감소 (스스로 퍼짐)
-    maxIter: 1200, // 반발 워밍업 + 본 시뮬 여유
+    maxIter: 1200, // 반발 워밍업 + 본 시뮬 여유 (대량 노드 시 initPositions에서 effectiveMaxIter로 축소)
     repulsionOnlyIter: 300, // UX: 반발 워밍업 확대 (250→300)
     padding: 100,
     useFullArea: true,
@@ -90,7 +201,17 @@ const LAYOUT_CONFIG = {
     packComponents: true,
     expansionFromCenter: 0.04, // 무게중심에서 바깥으로 밀어내기 강화
   },
-  ego: { padding: 70, minNodeSpacing: 58, subRowHeight: 46 },
+  ego: {
+    padding: 70,
+    minNodeSpacing: 58,
+    subRowHeight: 46,
+    // Vis.js 계층형 레이아웃 (지배구조 맵). physics: false와 함께 사용.
+    hierarchical: {
+      direction: "UD",
+      sortMethod: "directed",
+      nodeSpacing: 150,
+    },
+  },
 };
 
 // 노드 색상 정의: active/closed 상태별 색상
@@ -244,8 +365,8 @@ function calculateNodeSize(node, edges, selectedNodeId, connectedNodeIds) {
   }
 
   // 상태별 조정
-  const isSelected = selectedNodeId === node.id;
-  const isConnected = selectedNodeId ? connectedNodeIds.has(node.id) : false;
+  const isSelected = nodeIdsEqual(selectedNodeId, node.id);
+  const isConnected = selectedNodeId ? connectedNodeIds.has(String(node.id)) : false;
   let stateFactor = 1.0;
   if (isSelected) {
     stateFactor = 1.2; // 선택: +20%
@@ -335,9 +456,28 @@ let chatContext = null;
 let nodeDetailCache = {};
 let isEgoMode = false;
 let egoCenterId = null;
+/** 지배구조 맵 뷰 모드: 'heatmap' | 'ego'. 전환 시 재렌더만 하면 되도록 단일 진입점 유지 */
+const GOVERNANCE_MAP_VIEW = { HEATMAP: "heatmap", EGO: "ego" };
+let egoMapViewMode = GOVERNANCE_MAP_VIEW.EGO;
+
+// CTO: 히트맵 기능 on/off — 확장성·유지보수 (하드코딩 없이 설정으로 제어)
+const GOV_MAP_CONFIG = {
+  heatmapEnabled: false,
+};
+
+/** 지배구조 맵 DOM ID (HTML과 단일 소스, 협업/리팩터 시 검색 용이) */
+const GOV_MAP_IDS = {
+  wrap: "egoHeatmapWrap",
+  banner: "egoBanner",
+  bannerLabel: "egoBannerLabel",
+  btnHeatmap: "egoViewHeatmapBtn",
+  btnEgo: "egoViewEgoBtn",
+};
 // CTO: UX 패턴 - 선택된 노드와 연결된 노드 추적 (dimming 효과용)
 let selectedNodeId = null;
 let connectedNodeIds = new Set();
+// CTO: 노드 선택 직후 zoom 핸들러에서 renderGraph 스킵 (이중 렌더로 인한 밀집 방지)
+let lastNodeSelectionTime = 0;
 
 /* ═══════════════════════════════════════════
    API
@@ -383,8 +523,10 @@ async function apiCall(endpoint, options = {}) {
 function exitEgoMode() {
   isEgoMode = false;
   egoCenterId = null;
-  const banner = document.getElementById("egoBanner");
+  const banner = document.getElementById(GOV_MAP_IDS.banner);
   if (banner) banner.classList.add("util-hidden");
+  document.getElementById(GOV_MAP_IDS.wrap)?.classList.add("util-hidden");
+  document.getElementById("visNetwork")?.classList.remove("util-hidden");
   selectedNode = null;
   selectedNodeId = null;
   connectedNodeIds.clear();
@@ -404,7 +546,7 @@ function exitEgoMode() {
       visNetwork.once("stabilizationIterationsDone", doFit);
       setTimeout(doFit, 550);
     }
-    showEmptyPanel();
+    showEmptyPanel(true); // QA: 재렌더 생략 — 밀집 재현 방지 (loadGraph 내 이미 renderGraph 완료)
     updateStatus("전체 그래프로 돌아갔습니다", true);
   });
 }
@@ -479,50 +621,70 @@ async function loadEgoGraph(nodeId) {
     EDGES = res.edges;
     activeFilters = new Set(GRAPH_CONFIG.nodeTypes);
     positions = {};
-    
-    // CTO: ego_id가 NODES에 존재하는지 확인
+    egoMapViewMode = GOV_MAP_CONFIG.heatmapEnabled ? GOVERNANCE_MAP_VIEW.HEATMAP : GOVERNANCE_MAP_VIEW.EGO;
+
     const egoNode = NODES.find((n) => n.id === res.ego_id);
-    if (!egoNode) {
-      console.warn("Ego node not found in nodes, using first node as fallback:", res.ego_id);
-      // 폴백: 첫 번째 노드를 중심으로 사용
-      if (NODES.length > 0) {
-        computeHierarchicalLayout(NODES[0].id);
-      } else {
-        updateStatus(ERROR_MESSAGES.EGO_GRAPH_NO_NODES, false);
-        hideGraphLoading();
-        isEgoMode = false;
-        return;
-      }
-    } else {
-      computeHierarchicalLayout(res.ego_id);
+    if (!egoNode && NODES.length === 0) {
+      updateStatus(ERROR_MESSAGES.EGO_GRAPH_NO_NODES, false);
+      hideGraphLoading();
+      isEgoMode = false;
+      return;
     }
-    updateStatus("Neo4j 연결됨 (지배구조 맵)", true);
+    // 지배구조 맵: Vis.js hierarchical 레이아웃 사용 (positions 미사용)
+    updateStatus(UI_STRINGS.govMap.statusEgoLoaded, true);
     hideGraphLoading();
     selectedNode = NODES.find((n) => n.id === res.ego_id) || null;
     selectedNodeId = res.ego_id; // CTO: 상태 일관성 — 포커스/렌더링과 동기화
     if (selectedNode) {
+      // CTO: 노드 상세 전환 시에도 로딩 안내 적용 (검색·직접 클릭 경로와 동일)
+      switchTabById("detail");
+      renderNodeDetailFallback(selectedNode);
+      const requestedNodeId = selectedNode.id;
       const detail = await loadNodeDetail(selectedNode.id);
-      if (detail) renderNodeDetail(detail);
-      else renderNodeDetailFallback(selectedNode);
+      if (detail && nodeIdsEqual(selectedNodeId, requestedNodeId)) renderNodeDetail(detail);
+      else if (!detail) updateNodeDetailLoadingMessage(LOADING_MESSAGES.nodeDetailLoadError);
     }
-    const banner = document.getElementById("egoBanner");
+    const banner = document.getElementById(GOV_MAP_IDS.banner);
     if (banner) {
       banner.classList.remove("util-hidden");
-      const btn = banner.querySelector(".ego-exit-btn");
-      if (btn) btn.onclick = exitEgoMode;
+      const exitBtn = banner.querySelector(".ego-exit-btn");
+      if (exitBtn) exitBtn.onclick = exitEgoMode;
+      const heatBtn = document.getElementById(GOV_MAP_IDS.btnHeatmap);
+      const egoBtn = document.getElementById(GOV_MAP_IDS.btnEgo);
+      if (heatBtn) {
+        heatBtn.classList.toggle("util-hidden", !GOV_MAP_CONFIG.heatmapEnabled);
+        if (GOV_MAP_CONFIG.heatmapEnabled && !heatBtn._bound) {
+          heatBtn._bound = true;
+          heatBtn.addEventListener("click", showGovernanceMapHeatmapView);
+        }
+      }
+      if (egoBtn && !egoBtn._bound) {
+        egoBtn._bound = true;
+        egoBtn.addEventListener("click", showGovernanceMapEgoView);
+      }
     }
-    renderGraph();
-    // CTO: ego 중심 노드로 뷰 포커스 (fit만 하면 구석으로 밀리는 이슈 방지)
-    if (visNetwork && res.ego_id) {
-      const centerId = res.ego_id;
+    setGovernanceMapViewMode(egoMapViewMode);
+    // UX CTO: 지배구조 맵 보기와 포커스 차별화 — fit이면 전체 ego를 뷰에 맞춤, focus면 해당 노드에 줌
+    if (egoMapViewMode === GOVERNANCE_MAP_VIEW.EGO && visNetwork) {
+      const viewBehavior = EGO_GRAPH_CONFIG.initialViewAfterLoad || "fit";
       requestAnimationFrame(() => {
-        setTimeout(() => focusOnNode(centerId), 150);
+        setTimeout(() => {
+          try {
+            if (viewBehavior === "fit") {
+              visNetwork.fit({ animation: { duration: 400, easingFunction: "easeInOutQuad" } });
+            } else {
+              focusOnNode(res.ego_id);
+            }
+          } catch (e) {
+            console.warn("Ego initial view failed:", e);
+          }
+        }, 150);
       });
     }
   } catch (e) {
     isEgoMode = false;
     egoCenterId = null;
-    const banner = document.getElementById("egoBanner");
+    const banner = document.getElementById(GOV_MAP_IDS.banner);
     if (banner) banner.classList.add("util-hidden");
     updateStatus(ERROR_MESSAGES.EGO_GRAPH_LOAD_FAILED_STATUS, false, ERROR_CODES.NEO4J_CONNECTION_FAILED);
     hideGraphLoading();
@@ -548,6 +710,138 @@ async function loadEgoGraph(nodeId) {
   }
 }
 
+/* ═══════════════════════════════════════════
+   GOVERNANCE MAP VIEW (Heatmap / Ego)
+   단일 데이터 소스(ego API) → 뷰 모드에 따라 Heatmap 또는 Ego 그래프 렌더.
+   전환 시 재렌더만 하면 되도록 모듈화.
+═══════════════════════════════════════════ */
+
+/** 가중치 엣지 행렬 생성: from×to, 값은 지분율(%). */
+function buildWeightedEdgeMatrix(nodes, edges) {
+  if (!nodes?.length) return { nodeIds: [], labels: [], matrix: [] };
+  const idToNode = new Map(nodes.map((n) => [n.id, n]));
+  const orderIds = [].concat(nodes.map((n) => n.id));
+  orderIds.sort((a, b) => {
+    const la = (idToNode.get(a)?.label || a).toString();
+    const lb = (idToNode.get(b)?.label || b).toString();
+    return la.localeCompare(lb, "ko");
+  });
+  const n = orderIds.length;
+  const matrix = Array.from({ length: n }, () => Array(n).fill(0));
+  const edgeMap = new Map();
+  edges.forEach((e) => {
+    const key = `${e.from}\t${e.to}`;
+    const val = Number(e.ratio) || 0;
+    if (!edgeMap.has(key) || edgeMap.get(key) < val) edgeMap.set(key, val);
+  });
+  const idx = new Map(orderIds.map((id, i) => [id, i]));
+  edges.forEach((e) => {
+    const i = idx.get(e.from);
+    const j = idx.get(e.to);
+    if (i != null && j != null) matrix[i][j] = Number(e.ratio) || 0;
+  });
+  const labels = orderIds.map((id) => (idToNode.get(id)?.label || id).toString());
+  return { nodeIds: orderIds, labels, matrix };
+}
+
+/** 0~100 값을 브랜드 색상 그라데이션으로 반환 (가독성). */
+function heatmapColorForRatio(ratio) {
+  if (ratio <= 0) return "#f5f5f5";
+  const t = Math.min(1, ratio / 100);
+  const r = Math.round(245 - t * 169);
+  const g = Math.round(86 + t * 69);
+  const b = Math.round(4 + t * 0);
+  return `rgb(${r},${g},${b})`;
+}
+
+/** 가중치 엣지 히트맵 렌더 (동일 영역에서 Ego 그래프와 전환 가능). */
+function renderWeightedEdgeHeatmap(egoId, nodes, edges) {
+  const wrap = document.getElementById(GOV_MAP_IDS.wrap);
+  if (!wrap) return;
+  const { nodeIds, labels, matrix } = buildWeightedEdgeMatrix(nodes, edges);
+
+  const { title: heatmapTitle, sub: heatmapSub, ariaLabel: heatmapAria } = UI_STRINGS.heatmap;
+  let html = `
+    <div class="heatmap-header">
+      <span class="heatmap-title">${heatmapTitle}</span>
+      <span class="heatmap-sub">${heatmapSub}</span>
+    </div>
+    <div class="heatmap-scroll">
+      <table class="heatmap-table" role="grid" aria-label="${heatmapAria}">
+        <thead>
+          <tr><th class="heatmap-corner"></th>`;
+  nodeIds.forEach((id, j) => {
+    const short = String(labels[j]).slice(0, 12);
+    const isEgo = id === egoId;
+    html += `<th class="heatmap-th ${isEgo ? "heatmap-ego" : ""}" title="${esc(labels[j])}">${esc(short)}</th>`;
+  });
+  html += `</tr></thead><tbody>`;
+
+  nodeIds.forEach((id, i) => {
+    const isEgo = id === egoId;
+    html += `<tr><td class="heatmap-row-label ${isEgo ? "heatmap-ego" : ""}" title="${esc(labels[i])}">${esc(String(labels[i]).slice(0, 14))}</td>`;
+    nodeIds.forEach((idJ, j) => {
+      const v = matrix[i][j];
+      const color = heatmapColorForRatio(v);
+      const text = v > 0 ? (v % 1 === 0 ? String(v) : v.toFixed(1)) : "";
+      const cellTitle = `${String(labels[i]).replace(/"/g, "&quot;")} → ${String(labels[j]).replace(/"/g, "&quot;")}: ${text}%`;
+      html += `<td class="heatmap-cell" style="background:${color}" title="${cellTitle}">${text}</td>`;
+    });
+    html += `</tr>`;
+  });
+  html += `</tbody></table></div>`;
+  wrap.innerHTML = html;
+}
+
+/** 지배구조 맵 뷰 모드 설정 후 현재 모드에 맞게 렌더 (Ego 데이터는 이미 NODES/EDGES에 있음). */
+function setGovernanceMapViewMode(mode) {
+  if (mode === GOVERNANCE_MAP_VIEW.HEATMAP && !GOV_MAP_CONFIG.heatmapEnabled) mode = GOVERNANCE_MAP_VIEW.EGO;
+  egoMapViewMode = mode;
+  if (!isEgoMode || !egoCenterId) return;
+  const heatWrap = document.getElementById(GOV_MAP_IDS.wrap);
+  const visEl = document.getElementById("visNetwork");
+  const labelEl = document.getElementById(GOV_MAP_IDS.bannerLabel);
+  if (mode === GOVERNANCE_MAP_VIEW.HEATMAP) {
+    if (visEl) visEl.classList.add("util-hidden");
+    if (heatWrap) {
+      heatWrap.classList.remove("util-hidden");
+      renderWeightedEdgeHeatmap(egoCenterId, NODES, EDGES);
+    }
+    if (labelEl) labelEl.textContent = UI_STRINGS.govMap.viewHeatmap;
+  } else {
+    if (heatWrap) heatWrap.classList.add("util-hidden");
+    if (visEl) visEl.classList.remove("util-hidden");
+    renderGraph();
+    if (labelEl) labelEl.textContent = UI_STRINGS.govMap.viewEgo;
+  }
+  updateEgoBannerViewButtons();
+}
+
+function updateEgoBannerViewButtons() {
+  const heatBtn = document.getElementById(GOV_MAP_IDS.btnHeatmap);
+  const egoBtn = document.getElementById(GOV_MAP_IDS.btnEgo);
+  if (heatBtn) {
+    heatBtn.classList.toggle("util-hidden", !GOV_MAP_CONFIG.heatmapEnabled);
+    if (GOV_MAP_CONFIG.heatmapEnabled) {
+      heatBtn.classList.toggle("active", egoMapViewMode === GOVERNANCE_MAP_VIEW.HEATMAP);
+      heatBtn.setAttribute("aria-pressed", egoMapViewMode === GOVERNANCE_MAP_VIEW.HEATMAP);
+    }
+  }
+  if (egoBtn) {
+    egoBtn.classList.toggle("active", egoMapViewMode === GOVERNANCE_MAP_VIEW.EGO);
+    egoBtn.setAttribute("aria-pressed", egoMapViewMode === GOVERNANCE_MAP_VIEW.EGO);
+  }
+}
+
+function showGovernanceMapHeatmapView() {
+  if (!GOV_MAP_CONFIG.heatmapEnabled) return;
+  setGovernanceMapViewMode(GOVERNANCE_MAP_VIEW.HEATMAP);
+}
+
+function showGovernanceMapEgoView() {
+  setGovernanceMapViewMode(GOVERNANCE_MAP_VIEW.EGO);
+}
+
 // CTO: DOM 준비 상태 확인 함수 추가
 function ensureDOMReady() {
   return new Promise((resolve) => {
@@ -567,6 +861,11 @@ function ensureDOMReady() {
 
 async function loadGraph() {
   try {
+    // CTO: 전체 그래프(초기 랜딩·전체 그래프로 돌아가기) 시 제한 적용 알림을 다시 보여줄 수 있도록 리셋
+    window._initialViewNotified = false;
+    // QA: loadGraph → renderGraph 경로에서 physics 재활성화 억제 (전체 그래프 진입 시 밀집 방지)
+    window._loadGraphRendering = true;
+
     // CTO: DOM 준비 상태 확인
     await ensureDOMReady();
 
@@ -589,7 +888,7 @@ async function loadGraph() {
 
     isEgoMode = false;
     egoCenterId = null;
-    const banner = document.getElementById("egoBanner");
+    const banner = document.getElementById(GOV_MAP_IDS.banner);
     if (banner) banner.classList.add("util-hidden");
     updateStatus("데이터 로딩 중...", false);
     // CTO: UX 개선 - 메시지 일관성 유지
@@ -771,6 +1070,14 @@ async function loadGraph() {
       return;
     }
 
+    // CTO: 레이아웃/positions 계산을 위해 최소 1개 타입 필터 보장 — "positions not initialized yet" 방지
+    if (activeFilters.size === 0) {
+      activeFilters = new Set(GRAPH_CONFIG.nodeTypes);
+      document.querySelectorAll(".filter-pill").forEach((pill) => {
+        pill.classList.add("active");
+      });
+    }
+
     updateStatus("레이아웃 계산 중...", false);
     // CTO: UX 개선 - 메시지 일관성 유지
     showGraphLoading(
@@ -833,6 +1140,21 @@ async function loadGraph() {
       }
     }
 
+    // CTO: "positions not initialized yet" 방지 — 레이아웃 실패/필터 꺼짐 등으로 positions 비었을 때 최소 fallback
+    if (NODES.length > 0 && Object.keys(positions).length === 0) {
+      const vp = getGraphViewport();
+      const cx = vp.width / 2;
+      const cy = vp.height / 2;
+      const radius = Math.min(vp.width, vp.height) * 0.35;
+      NODES.forEach((n, i) => {
+        const angle = (i / Math.max(NODES.length, 1)) * Math.PI * 2;
+        positions[n.id] = {
+          x: cx + Math.cos(angle) * radius,
+          y: cy + Math.sin(angle) * radius,
+        };
+      });
+    }
+
     updateStatus("렌더링 중...", false);
     // CTO: UX 개선 - 메시지 일관성 유지
     showGraphLoading(
@@ -844,6 +1166,7 @@ async function loadGraph() {
     try {
       // CTO: Vis.js는 waitForVisJs()에서 이미 확인됨
       renderGraph();
+      window._loadGraphRendering = false; // QA: 전체 그래프 진입 후 physics 억제 플래그 해제
       // CTO: Vis.js는 렌더링 후 자동으로 fit
       if (visNetwork) {
         setTimeout(() => {
@@ -853,12 +1176,14 @@ async function loadGraph() {
       hideGraphLoading();
       updateStatus("Neo4j 연결됨", true);
     } catch (renderError) {
+      window._loadGraphRendering = false;
       console.error("Render failed:", renderError);
       hideGraphLoading();
       updateStatus("렌더링 실패", false);
       // 렌더링 실패해도 앱은 계속 작동하도록
     }
   } catch (e) {
+    window._loadGraphRendering = false;
     hideGraphLoading();
     updateStatus("연결 실패", false);
     console.error("Load graph failed:", e);
@@ -885,10 +1210,13 @@ const RETRY_DELAY_BASE = 3000; // 3초
 
 function classifyError(err) {
   if (!err) return ERROR_CODES.UNKNOWN;
-  
-  const message = err.message || "";
+
+  const message = (err.message || "").toString();
   if (message.includes("Failed to fetch") || message.includes("NetworkError")) {
     return ERROR_CODES.NETWORK_ERROR;
+  }
+  if (message.includes("Backend") && message.includes("연결")) {
+    return ERROR_CODES.BACKEND_CONNECTION_FAILED;
   }
   if (message.includes("timeout") || message.includes("Timeout")) {
     return ERROR_CODES.TIMEOUT;
@@ -955,45 +1283,51 @@ function showConnectionError(err) {
   
   const errorMessages = {
     [ERROR_CODES.NETWORK_ERROR]: "네트워크 연결을 확인해주세요",
+    [ERROR_CODES.BACKEND_CONNECTION_FAILED]: "서버에 연결할 수 없습니다",
     [ERROR_CODES.TIMEOUT]: "서버 응답 시간이 초과되었습니다",
     [ERROR_CODES.SERVICE_UNAVAILABLE]: "서비스가 일시적으로 사용할 수 없습니다",
     [ERROR_CODES.SERVER_ERROR]: "서버 오류가 발생했습니다",
     [ERROR_CODES.UNKNOWN]: "서버에 연결할 수 없습니다",
   };
-  
+
   const userMessage = errorMessages[errorType] || errorMessages[ERROR_CODES.UNKNOWN];
-  
-  // 로깅
+  const isLocalBackend =
+    API_BASE.indexOf("localhost") !== -1 || API_BASE.indexOf("127.0.0.1") !== -1;
+  const remoteTip =
+    !isLocalBackend
+      ? " 원격 서버는 절전 후 첫 연결에 30초~1분 걸릴 수 있습니다. 잠시 후 '다시 시도'를 눌러보세요."
+      : "";
+
   console.error("Connection error:", {
     type: errorType,
     message: err?.message || "Unknown error",
+    apiBase: API_BASE,
     timestamp: new Date().toISOString(),
   });
-  
+
   graphArea.innerHTML = `
     <div class="error-container">
       <div class="error-icon">⚠️</div>
       <h2 class="error-title">${userMessage}</h2>
-      <p class="error-message">백엔드 서버가 실행 중인지 확인해주세요.</p>
-      
+      <p class="error-message">백엔드 서버가 실행 중인지 확인해주세요.${remoteTip}</p>
+      <p class="error-message" style="margin-top:8px;font-size:12px;color:var(--text-3);">
+        연결 시도 주소: <code style="word-break:break-all;">${tryUrl}</code>
+      </p>
       <div class="error-actions">
         <button class="btn-primary" onclick="retryConnection()">다시 시도</button>
         <button class="btn-secondary" onclick="toggleErrorDetails()">상세 정보</button>
       </div>
-      
       <div class="error-details hidden" id="errorDetails">
         <div class="error-details-content">
           <p><strong>연결 주소:</strong> <code>${tryUrl}</code></p>
           <p><strong>에러 타입:</strong> <code>${errorType}</code></p>
           <p><strong>해결 방법:</strong></p>
           <ol>
-            <li>터미널에서 <code>make stop-be</code> 실행</li>
-            <li>새 터미널에서 <code>make run-be</code> 실행</li>
-            <li>이 페이지에서 다시 시도</li>
+            <li>로컬: 터미널에서 <code>make run-be</code> 실행 후 이 페이지에서 다시 시도</li>
+            <li>포트 충돌 시 <code>make stop-be</code> 후 <code>make run-be</code></li>
+            <li>진단: <code>make check-be</code> 또는 <code>curl ${tryUrl}</code></li>
           </ol>
-          <p style="margin-top:12px;"><strong>진단:</strong></p>
-          <p>진단: <code>make check-be</code> | 수동 확인: <code>curl ${tryUrl}</code></p>
-          <p>파일로 열었다면: <code>make serve-graph</code> 실행 후 <code>http://localhost:8080/graph.html</code> 접속</p>
+          <p style="margin-top:12px;">파일로 열었다면: <code>make serve-graph</code> 실행 후 <code>http://localhost:8080/static/graph.html</code> 접속</p>
         </div>
       </div>
     </div>
@@ -1167,6 +1501,9 @@ const LOADING_MESSAGES = {
   computingLayout: "그래프 구성 중…",
   rendering: "렌더링 중…",
   loadingEgo: "지배구조 맵 로딩 중…",
+  // CTO: 노드 상세 — 단일 소스, 추후 백엔드 진행도 이벤트 시 updateNodeDetailLoadingMessage로 확장
+  nodeDetailLoading: "노드 상세 불러오는 중…",
+  nodeDetailLoadError: "상세 정보를 불러올 수 없습니다.",
 };
 
 const LOADING_GUIDANCE = {
@@ -1405,7 +1742,11 @@ function buildGraphView(nodes, edges, typeFilterSet) {
     connectedNodeIds.add(e.to);
   });
   const allNodes = (nodes || []).filter(
-    (n) => n && n.id && typeFilterSet.has(n.type) && connectedNodeIds.has(n.id),
+    (n) =>
+      n &&
+      n.id &&
+      typeFilterSet.has(canonicalNodeType(n.type)) &&
+      connectedNodeIds.has(n.id),
   );
   const nodeDegrees = new Map();
   allNodes.forEach((n) => {
@@ -1526,12 +1867,20 @@ function initPositions() {
     const idealMin = cfg.idealDistMin;
     const idealMax = cfg.idealDistMax;
     let iter = 0;
+    // 대량 노드 시 반복 수 축소: 초기 진입 속도 우선 (확장성)
+    const effectiveMaxIter =
+      allNodes.length > 4000
+        ? 250
+        : allNodes.length > 2500
+          ? 400
+          : allNodes.length > 1500
+            ? 600
+            : cfg.maxIter;
 
     function step() {
       try {
         const batchSize = 12;
-        const maxIter = cfg.maxIter;
-        for (let i = 0; i < batchSize && iter < maxIter; i++, iter++) {
+        for (let i = 0; i < batchSize && iter < effectiveMaxIter; i++, iter++) {
           allNodes.forEach((n) => {
             if (!positions[n.id]) return;
             let fx = 0,
@@ -1642,12 +1991,7 @@ function initPositions() {
           });
         }
 
-        if (iter < maxIter) {
-          try {
-            renderGraph();
-          } catch (_) {
-            /* 레이아웃 중 렌더 실패 시 무시 */
-          }
+        if (iter < effectiveMaxIter) {
           requestAnimationFrame(step);
         } else {
           // 최종 충돌 해소: 물리적 반지름(원+라벨) 기준으로 분리
@@ -1752,52 +2096,97 @@ let visNetwork = null; // Vis.js 네트워크 인스턴스
 let visNetworkEventsSetup = false; // QA: 이벤트 리스너 중복 등록 방지
 let physicsEnabledState = false; // CTO: physics 상태 추적 (getOptions 대신 사용)
 
+// QA/CTO: getScale 비정상(0/NaN) 시 1.0 반환 — 라벨·줌 컨트롤 사이드 이펙트 방지, 단일 진입점
+function getScaleSafe(network) {
+  if (!network || typeof network.getScale !== "function") return 1.0;
+  const s = network.getScale();
+  return typeof s === "number" && s > 0 ? s : 1.0;
+}
+
+// QA/CTO: 검색/연결 노드 클릭 시 노드 이름 미표시 방지 — API·DOM·Vis.js 간 id 타입(문자열/숫자) 불일치 흡수, 단일 진입점
+function nodeIdsEqual(a, b) {
+  return a != null && b != null && String(a) === String(b);
+}
+
+/**
+ * CTO: 빈 공간 클릭 시 선택 해제만 반영 — setData/renderGraph 호출 없이 기존 노드 스타일만 갱신.
+ * 레이아웃·physics 유지로 "한 덩어리로 붙는" 현상 및 지속적 밀집 재현 방지 (확장성·유지보수).
+ */
+function clearSelectionVisualState(network) {
+  if (!network || !network.body || !network.body.data || !network.body.data.nodes) return;
+  const nodesDataSet = network.body.data.nodes;
+  const ids = nodesDataSet.getIds();
+  if (ids.length === 0) return;
+  const updates = [];
+  for (const id of ids) {
+    const visNode = nodesDataSet.get(id);
+    if (!visNode || !visNode.color) continue;
+    const borderColor = visNode.color.border || "#999";
+    updates.push({
+      id,
+      color: {
+        background: getNodeFillColor(borderColor, 0.15),
+        border: borderColor,
+        highlight: {
+          background: getNodeFillColor(borderColor, 0.3),
+          border: borderColor,
+        },
+        opacity: 1,
+      },
+      borderWidth: 2,
+      shadow: false,
+    });
+  }
+  if (updates.length > 0) nodesDataSet.update(updates);
+  // QA: 선택 시 비연결 엣지 dimming(0.2) 해제 — 엣지도 opacity 1로 복원
+  const edgesDataSet = network.body.data.edges;
+  if (edgesDataSet && typeof edgesDataSet.getIds === "function") {
+    const edgeIds = edgesDataSet.getIds();
+    const edgeUpdates = edgeIds.map((id) => {
+      const edge = edgesDataSet.get(id);
+      if (!edge || !edge.color) return null;
+      return {
+        id,
+        color: {
+          color: edge.color.color || "#8b7d6f",
+          highlight: edge.color.highlight || "#d85604",
+          opacity: 1,
+        },
+      };
+    }).filter(Boolean);
+    if (edgeUpdates.length > 0) edgesDataSet.update(edgeUpdates);
+  }
+}
+
 // CTO: Vis.js 이벤트 리스너 설정 (UX 패턴 반영)
 function setupVisNetworkEvents(network) {
   if (visNetworkEventsSetup) return;
 
-  // CTO: 노드 클릭 시 네트워크 중심 뷰 + dimming 효과
+  // 노드 클릭: openEgoOnNodeClick이면 ego 로드, 아니면 selectNode(상세 패널 + dimming + 포커스)
   network.on("click", (params) => {
     if (params.nodes.length > 0) {
       const nodeId = params.nodes[0];
-      const node = NODES.find((n) => n.id === nodeId);
+      const node = NODES.find((n) => nodeIdsEqual(n.id, nodeId));
       if (node) {
-        // 선택된 노드 업데이트
-        selectedNodeId = nodeId;
-
-        // 연결된 노드 ID 수집 (dimming 효과용)
-        connectedNodeIds.clear();
-        const connectedEdges = network.getConnectedEdges(nodeId);
-        connectedEdges.forEach((edgeId) => {
-          const edge = network.body.data.edges.get(edgeId);
-          if (edge) {
-            if (edge.from === nodeId) connectedNodeIds.add(edge.to);
-            if (edge.to === nodeId) connectedNodeIds.add(edge.from);
-          }
-        });
-
-        // 노드 선택 및 상세 정보 표시
-        selectNode(node);
-
-        // CTO: 그래프 재렌더링으로 dimming 효과 적용 (먼저 렌더링)
-        renderGraph();
-
-        // CTO: 선택 노드로 뷰 포커스 (공통 focusOnNode로 일관된 줌/패닝)
-        focusOnNode(nodeId);
+        if (GRAPH_CONFIG.openEgoOnNodeClick) {
+          loadEgoGraph(nodeId);
+          return;
+        }
+        selectNode(node); // 내부에서 renderGraph 후 focusOnNode 호출 (포커스·유동성 이슈 방지)
       }
     } else {
-      // 빈 공간 클릭 시 선택 해제
+      // CTO: 빈 공간 클릭 시 전체 재렌더 없이 선택 해제만 적용 — 밀집 재현·지속 이슈 방지
       selectedNodeId = null;
       connectedNodeIds.clear();
       network.unselectAll();
-      renderGraph();
-      showEmptyPanel();
+      clearSelectionVisualState(network);
+      showEmptyPanel(true); // QA: 재렌더 생략으로 레이아웃 유지(밀집 재현 방지)
     }
   });
 
   // CTO: 호버 시 라벨 강조 (가독성 개선)
   network.on("hoverNode", (params) => {
-    const node = NODES.find((n) => n.id === params.node);
+    const node = NODES.find((n) => nodeIdsEqual(n.id, params.node));
     if (node) {
       showTooltip(node, params.event.x, params.event.y);
 
@@ -1819,9 +2208,9 @@ function setupVisNetworkEvents(network) {
     if (params && params.node) {
       const visNode = network.body.data.nodes.get(params.node);
       if (visNode) {
-        const node = NODES.find((n) => n.id === params.node);
-        const isSelected = selectedNodeId === params.node;
-        const isConnected = connectedNodeIds.has(params.node);
+        const node = NODES.find((n) => nodeIdsEqual(n.id, params.node));
+        const isSelected = nodeIdsEqual(selectedNodeId, params.node);
+        const isConnected = connectedNodeIds.has(String(params.node));
 
         // 원래 폰트 크기로 복원
         visNode.font.size = isSelected ? 14 : isConnected ? 13 : 12;
@@ -1843,8 +2232,9 @@ function setupVisNetworkEvents(network) {
 }
 
 function renderGraphWithVisJs() {
-  // Vis.js 렌더링 (PyGraphviz 좌표 + 부드러운 UX)
-  if (NODES.length === 0 || Object.keys(positions).length === 0) {
+  if (NODES.length === 0) return;
+  // QA/CTO: ego(지배구조 맵)는 Vis.js hierarchical이 위치 계산 — positions 불필요. 비-ego에서만 positions 필수
+  if (!isEgoMode && Object.keys(positions).length === 0) {
     console.warn("renderGraphWithVisJs: positions not initialized yet");
     return;
   }
@@ -1908,83 +2298,57 @@ function renderGraphWithVisJs() {
     container.style.height = vpH + "px";
   }
 
-  // QA: 필터링 - 모든 활성 필터 노드를 표시 (dimming은 렌더링 시 처리)
-  let visibleNodes = NODES.filter((n) => activeFilters.has(n.type));
-
-  // CTO: 초기 뷰 제한 적용 (대량 노드 환경 가독성 개선)
-  if (
-    INITIAL_VIEW_CONFIG.enabled &&
-    visibleNodes.length > INITIAL_VIEW_CONFIG.maxNodes
-  ) {
-    const filteredNodes = visibleNodes.filter((n) => {
-      // 타입 필터
-      if (!INITIAL_VIEW_CONFIG.showTypes.includes(n.type)) return false;
-
-      // 연결 수 확인
-      const nodeEdges = EDGES.filter((e) => e.from === n.id || e.to === n.id);
-      const degree = nodeEdges.length;
-      const maxRatio = Math.max(
-        ...nodeEdges.map((e) => Number(e.ratio || 0)),
-        0,
-      );
-
-      // 중요도 확인
-      if (degree < INITIAL_VIEW_CONFIG.minConnections) return false;
-      if (maxRatio < INITIAL_VIEW_CONFIG.minRatio && n.type === "person")
-        return false;
-
-      return true;
-    });
-
-    // 최대 노드 수 제한 및 중요도 순 정렬
-    if (filteredNodes.length > INITIAL_VIEW_CONFIG.maxNodes) {
-      visibleNodes = filteredNodes
-        .map((n) => {
-          const nodeEdges = EDGES.filter(
-            (e) => e.from === n.id || e.to === n.id,
-          );
-          const degree = nodeEdges.length;
-          const maxRatio = Math.max(
-            ...nodeEdges.map((e) => Number(e.ratio || 0)),
-            0,
-          );
-          const importance = degree * 0.1 + maxRatio * 0.05;
-          return { node: n, importance };
-        })
-        .sort((a, b) => b.importance - a.importance)
-        .slice(0, INITIAL_VIEW_CONFIG.maxNodes)
-        .map((item) => item.node);
-    } else {
-      visibleNodes = filteredNodes;
-    }
-
-    // 사용자에게 알림 (한 번만)
-    if (!window._initialViewNotified) {
-      updateStatus(
-        `초기 뷰: 중요 노드 ${visibleNodes.length}개만 표시됩니다. 필터를 조정하여 더 많은 노드를 볼 수 있습니다.`,
-        true,
-      );
-      window._initialViewNotified = true;
-      setTimeout(() => {
-        if (window._initialViewNotified) {
-          updateStatus("Neo4j 연결됨", true);
-          window._initialViewNotified = false;
+  // CTO: 단일 진입점 — 초기 랜딩·"전체 그래프로 돌아가기" 클릭 시 동일 제한 적용 (밀집 방지)
+  let { visibleNodes, didApplyLimit } =
+    isEgoMode
+      ? {
+          visibleNodes: NODES.filter((n) =>
+            activeFilters.has(canonicalNodeType(n.type)),
+          ),
+          didApplyLimit: false,
         }
-      }, 5000);
+      : computeVisibleNodesForRender(NODES, EDGES, activeFilters);
+
+  // QA/CTO: 검색·연관검색어 클릭 시 선택 노드가 제한(380)으로 빠지면 이름 미표시 — 선택 노드는 항상 표시 집합에 포함
+  if (selectedNodeId) {
+    const selectedNode = NODES.find((n) => nodeIdsEqual(n.id, selectedNodeId));
+    const alreadyVisible = visibleNodes.some((n) => nodeIdsEqual(n.id, selectedNodeId));
+    if (selectedNode && !alreadyVisible) {
+      visibleNodes = visibleNodes.slice();
+      visibleNodes.push(selectedNode);
     }
   }
 
-  const visibleIds = new Set(visibleNodes.map((n) => n.id));
+  if (didApplyLimit && !window._initialViewNotified) {
+    updateStatus(
+      `가독성: 중요 노드 ${visibleNodes.length}개만 표시됩니다. '개인주주' 필터 또는 필터 조정으로 더 보기.`,
+      true,
+    );
+    window._initialViewNotified = true;
+    setTimeout(() => {
+      if (window._initialViewNotified) {
+        updateStatus("Neo4j 연결됨", true);
+        window._initialViewNotified = false;
+      }
+    }, 5000);
+  }
+
+  const visibleIds = new Set();
+  visibleNodes.forEach((n) => {
+    visibleIds.add(n.id);
+    visibleIds.add(String(n.id));
+  });
   const visibleEdges = EDGES.filter(
     (e) => visibleIds.has(e.from) && visibleIds.has(e.to),
   );
   // CTO: UX 패턴 - 노드 상태에 따른 시각적 차별화 (focused/dimmed 효과)
   const visNodes = visibleNodes.map((n) => {
     const p = positions[n.id] || { x: vpW / 2, y: vpH / 2 };
+    const useFixedPosition = !isEgoMode && positions[n.id];
     const color = getNodeColor(n);
-    const isSelected = selectedNodeId === n.id;
-    // QA: 전역 변수 connectedNodeIds 사용 (setupVisNetworkEvents에서 설정됨)
-    const isConnected = selectedNodeId ? connectedNodeIds.has(n.id) : false;
+    const isSelected = nodeIdsEqual(selectedNodeId, n.id);
+    // QA: 전역 변수 connectedNodeIds 사용 (설정 시 String으로 저장 — 타입 불일치 방지)
+    const isConnected = selectedNodeId ? connectedNodeIds.has(String(n.id)) : false;
 
     // CTO: 데이터 기반 동적 노드 크기 계산 (연결 수 + 지분율 + 상태)
     const nodeSize = calculateNodeSize(
@@ -2012,40 +2376,43 @@ function renderGraphWithVisJs() {
       opacity < 1.0 ? opacity * 0.3 : 0.15,
     );
 
-    // CTO: 줌 레벨 기반 라벨 표시 (가독성 개선)
-    // CTO: 줌 레벨 기반 라벨 표시 강화 (가독성 개선)
-    const currentZoom = visNetwork ? visNetwork.getScale() : 1.0;
-    const minZoomForLabels = 1.2; // CTO: 라벨 표시 최소 줌 레벨 증가 (0.7→1.2) - 밀집 방지
+    // CTO: 줌 레벨 기반 라벨 표시 — 노드 이름 일시적 비표시 이슈 완화 (getScaleSafe 단일 진입점)
+    const currentZoom = getScaleSafe(visNetwork);
+    const minZoomForLabels = 0.92; // CTO: 1.2→0.92 — 일반 줌에서도 라벨 표시, "이름 안 보임" 이슈 감소
     const showLabel =
       currentZoom >= minZoomForLabels || isSelected || isConnected;
 
-    // CTO: 중요도 기반 라벨 표시 (줌 레벨이 낮을 때)
+    // CTO: 중요도 기반 라벨 표시 (줌이 매우 낮을 때만 일부 숨김)
     let labelText = "";
     let labelFontSize = 0;
     if (showLabel) {
       labelText = n.label || n.id;
-      // 중요도 계산 (연결 수 기반)
       const nodeEdges = visibleEdges.filter(
         (e) => e.from === n.id || e.to === n.id,
       );
       const degree = nodeEdges.length;
-      const isImportant = degree >= 10 || isSelected; // CTO: 중요도 기준 상향 (5→10) - 더 중요한 노드만 표시
+      const isImportant = degree >= 8 || isSelected; // CTO: 10→8 — 더 많은 노드에 라벨 노출
 
-      if (currentZoom < 1.5 && !isImportant && !isSelected && !isConnected) {
-        // CTO: 줌 레벨이 낮고 중요하지 않은 노드는 라벨 숨김 (1.0→1.5로 상향)
+      if (currentZoom < 1.0 && !isImportant && !isSelected && !isConnected) {
+        // CTO: 1.5→1.0 — 줌 1.0 이상에서는 대부분 라벨 표시
         labelText = "";
         labelFontSize = 0;
       } else {
         labelFontSize = isSelected ? 14 : isImportant ? 13 : 12;
       }
     }
+    // QA: 검색/클릭 후 포커스된 노드는 항상 라벨 표시 (노드 이름 안 나오는 이슈 방지)
+    if (isSelected) {
+      labelText = labelText || n.label || n.id;
+      labelFontSize = Math.max(labelFontSize || 0, 12);
+    }
 
-    return {
+    const nodeOption = {
       id: n.id,
       label: labelText,
-      x: p.x,
-      y: p.y,
-      // CTO: 타 서비스 패턴 - physics 활성화 시 동적 위치 관리 (안정화 후 고정)
+      // ego 모드(지배구조 맵)에서는 x,y 생략 → Vis.js hierarchical이 위치 계산
+      ...(useFixedPosition ? { x: p.x, y: p.y } : {}),
+      // 타 서비스 패턴 - physics 활성화 시 동적 위치 관리 (안정화 후 고정)
       // fixed 속성 제거: 초기 안정화 전에는 동적, 안정화 후에는 physics: false로 고정
       color: {
         background: fillColor, // CTO: 채우기 색상 (범례와 일치)
@@ -2074,6 +2441,7 @@ function renderGraphWithVisJs() {
           }
         : false, // 선택된 노드만 그림자 효과
     };
+    return nodeOption;
   });
   const edgeMap = new Map();
   visibleEdges.forEach((e) => {
@@ -2085,14 +2453,14 @@ function renderGraphWithVisJs() {
   const connectedEdgeKeys = new Set();
   if (selectedNodeId) {
     visibleEdges.forEach((e) => {
-      if (e.from === selectedNodeId || e.to === selectedNodeId) {
+      if (nodeIdsEqual(e.from, selectedNodeId) || nodeIdsEqual(e.to, selectedNodeId)) {
         connectedEdgeKeys.add(`${e.from}-${e.to}`);
       }
     });
   }
 
-  // UX: 줌 레벨 기반 엣지 라벨 표시 (가독성 개선)
-  const currentZoom = visNetwork ? visNetwork.getScale() : 1.0;
+  // UX: 줌 레벨 기반 엣지 라벨 표시 (가독성 개선) — getScaleSafe 단일 진입점
+  const currentZoomEdge = getScaleSafe(visNetwork);
   const minZoomForEdgeLabels = 1.5; // UX: 엣지 라벨 표시 최소 줌 레벨
   const minRatioForLabel = 1.0; // UX: 라벨 표시 최소 지분율 (%)
 
@@ -2125,12 +2493,12 @@ function renderGraphWithVisJs() {
 
     // UX: 줌 레벨 및 중요도 기반 라벨 표시 조건
     let finalLabel = "";
-    if (currentZoom >= minZoomForEdgeLabels || isConnected) {
+    if (currentZoomEdge >= minZoomForEdgeLabels || isConnected) {
       // 줌 레벨이 높거나 연결된 엣지는 라벨 표시
       finalLabel = edgeLabel;
 
       // UX: 중요도 기반 추가 필터링 (지분율 1% 미만은 숨김, 단 연결된 엣지는 예외)
-      if (ratio < minRatioForLabel && !isConnected && currentZoom < 2.0) {
+      if (ratio < minRatioForLabel && !isConnected && currentZoomEdge < 2.0) {
         finalLabel = "";
       }
     }
@@ -2173,25 +2541,26 @@ function renderGraphWithVisJs() {
       smooth: { type: "continuous", roundness: 0.5 },
       arrows: { to: { enabled: true, scaleFactor: 0.8 } },
     },
-    // CTO: 타 서비스 패턴 - "안정화 후 고정" 전략
-    // 초기 렌더링 시 physics 활성화하여 자동 레이아웃, 안정화 완료 후 비활성화
-    physics: {
-      enabled: true, // 초기 안정화를 위해 활성화
-      solver: "forceAtlas2Based",
-      forceAtlas2Based: {
-        gravitationalConstant: -60,
-        centralGravity: 0.005,
-        springLength: 150,
-        springConstant: 0.04,
-        damping: 0.6,
-        avoidOverlap: 0.6, // ⭐ 핵심: 노드 겹침 방지
-      },
-      stabilization: {
-        enabled: true,
-        iterations: 100,
-        fit: true, // 안정화 완료 후 화면에 맞게 조정
-      },
-    },
+    // 전체 그래프: physics로 안정화 후 고정. 지배구조 맵(ego): Vis.js hierarchical + physics 비활성화
+    physics: isEgoMode
+      ? false
+      : {
+          enabled: true,
+          solver: "forceAtlas2Based",
+          forceAtlas2Based: {
+            gravitationalConstant: -60,
+            centralGravity: 0.005,
+            springLength: 150,
+            springConstant: 0.04,
+            damping: 0.6,
+            avoidOverlap: 0.6,
+          },
+          stabilization: {
+            enabled: true,
+            iterations: 100,
+            fit: true,
+          },
+        },
     // CTO: 그래프 DB 전문가 관점 - 인터랙션 설정 최적화
     // 문제: 노드 선택 후 줌 기능이 제대로 작동하지 않음
     // 해결: 수동 휠 이벤트 처리로 스크롤과 줌 구분, 안정화 중 인터랙션 제한
@@ -2203,7 +2572,9 @@ function renderGraphWithVisJs() {
       tooltipDelay: 100, // 툴팁 지연 감소
       hover: true, // 호버 효과 활성화
     },
-    layout: { improvedLayout: false }, // 이미 계산된 좌표 사용
+    layout: isEgoMode
+      ? { hierarchical: LAYOUT_CONFIG.ego.hierarchical }
+      : { improvedLayout: false },
     // CTO: animation은 top-level 옵션이 아님 (moveTo/fit/focus 메서드의 파라미터로만 사용)
     // 노드/엣지 상태 변경 시 부드러운 전환은 physics.enabled=false일 때 자동으로 처리됨
   };
@@ -2253,10 +2624,10 @@ function renderGraphWithVisJs() {
       container.addEventListener('wheel', (e) => {
         e.preventDefault();
         
-        // Ctrl/Cmd + 휠 = 줌
+        // Ctrl/Cmd + 휠 = 줌 (QA: getScaleSafe로 0/NaN 방지)
         if (e.ctrlKey || e.metaKey) {
           const delta = e.deltaY > 0 ? 0.9 : 1.1; // 휠 아래 = 축소, 위 = 확대
-          const currentScale = visNetwork.getScale();
+          const currentScale = getScaleSafe(visNetwork);
           const newScale = Math.max(0.3, Math.min(3, currentScale * delta));
           
           // 마우스 위치를 중심으로 줌
@@ -2303,9 +2674,17 @@ function renderGraphWithVisJs() {
       // UX: 디바운싱으로 성능 최적화 (줌 중에는 재렌더링 지연)
       if (zoomTimeout) clearTimeout(zoomTimeout);
       zoomTimeout = setTimeout(() => {
-        // 줌 레벨 변경 시 그래프 재렌더링하여 라벨 표시 업데이트
-        // 주의: renderGraph()가 physics를 재활성화하지 않도록 주의
-        // CTO: getOptions()는 Vis.js에서 지원하지 않으므로 상태 변수 사용
+        if (!visNetwork) return;
+        if (window._loadGraphRendering) return; // QA: loadGraph 진행 중엔 재렌더 생략 — "positions not initialized yet" 방지
+        if (!isEgoMode && Object.keys(positions).length === 0) return;
+        const skipMs = (typeof UX_CONFIG !== "undefined" && UX_CONFIG.zoomHandlerSkipMsAfterSelect) || 0;
+        if (skipMs > 0 && Date.now() - lastNodeSelectionTime < skipMs) return; // 노드 클릭→드래그→다른 노드 클릭 시 이중 렌더·밀집 방지
+        // QA/CTO: 줌(-)/(+) 버튼 적용 안 되는 이슈 — setData()가 뷰를 리셋하므로 복원
+        const savedScale = getScaleSafe(visNetwork);
+        const savedPosition =
+          typeof visNetwork.getViewPosition === "function"
+            ? visNetwork.getViewPosition()
+            : null;
         const currentPhysics = physicsEnabledState;
         renderGraph();
         // Physics 상태 복원 (안정화 완료 후에는 false 유지)
@@ -2313,22 +2692,71 @@ function renderGraphWithVisJs() {
           visNetwork.setOptions({ physics: false });
           physicsEnabledState = false; // 상태 추적 업데이트
         }
+        // 줌 버튼/휠로 변경한 scale·position 유지 (setData 후 뷰 리셋 방지)
+        if (
+          savedPosition != null &&
+          typeof visNetwork.moveTo === "function"
+        ) {
+          requestAnimationFrame(() => {
+            if (visNetwork)
+              visNetwork.moveTo({
+                scale: savedScale,
+                position: savedPosition,
+                animation: false,
+              });
+          });
+        }
       }, 150); // 150ms 디바운싱
     });
     visNetwork._zoomHandlerAdded = true; // 중복 이벤트 리스너 방지
   }
   try {
     if (visNetwork) {
+      // CTO: 노드→다른 노드 클릭(드래그 유무 무관) 시 setData가 뷰를 리셋해 밀집처럼 보이는 것 방지 — 저장/복원
+      const preserveView = !window._loadGraphRendering;
+      let savedScale = null;
+      let savedPosition = null;
+      if (preserveView && typeof visNetwork.getScale === "function") {
+        savedScale = getScaleSafe(visNetwork);
+        if (typeof visNetwork.getViewPosition === "function") {
+          savedPosition = visNetwork.getViewPosition();
+        }
+      }
       // QA: 기존 인스턴스 업데이트
       visNetwork.setData(data);
-      visNetwork.setOptions(options);
-      // CTO: 타 서비스 패턴 - 데이터 업데이트 시 physics 재활성화 (필터링/데이터 변경 시)
-      // 안정화 완료 후 자동으로 physics: false로 전환됨
-      // 주의: 노드 선택 후에는 physics 재활성화하지 않음 (사용자 인터랙션 보호)
-      const shouldReenablePhysics = !selectedNodeId; // 노드 선택 중이면 physics 재활성화 안 함
+      // CTO: 노드 클릭 시 physics 재활성화 방지 — 포커스 유지·화면 유동성 제거 (확장성·유지보수)
+      const opts =
+        !isEgoMode && !physicsEnabledState
+          ? { ...options, physics: false }
+          : options;
+      visNetwork.setOptions(opts);
+      if (isEgoMode) {
+        physicsEnabledState = false;
+        return;
+      }
+      // QA: loadGraph(초기 랜딩·전체 그래프 복귀) 후 렌더 시 physics 재활성화 억제 — 밀집 재현 방지
+      if (window._loadGraphRendering) {
+        visNetwork.setOptions({ physics: false });
+        physicsEnabledState = false;
+        window._loadGraphRendering = false;
+        return;
+      }
+      // CTO: 빈 공간 클릭 시 physics 재활성화 방지 — 이미 안정된 레이아웃이 한 덩어리로 붙는 이슈 해결
+      const shouldReenablePhysics =
+        !selectedNodeId && physicsEnabledState;
       if (shouldReenablePhysics) {
         visNetwork.setOptions({ physics: true });
-        physicsEnabledState = true; // 상태 추적 업데이트
+        physicsEnabledState = true;
+      }
+      if (preserveView && savedPosition != null && savedScale != null && typeof visNetwork.moveTo === "function") {
+        requestAnimationFrame(() => {
+          if (visNetwork)
+            visNetwork.moveTo({
+              scale: savedScale,
+              position: savedPosition,
+              animation: false,
+            });
+        });
       }
     } else {
       // QA: 새 인스턴스 생성 (이벤트 리스너는 setupVisNetworkEvents에서 한 번만 등록)
@@ -2355,8 +2783,9 @@ function renderGraphWithVisJs() {
 }
 
 function renderGraph() {
-  // CTO: Vis.js 단일 렌더링 엔진
-  if (NODES.length === 0 || Object.keys(positions).length === 0) {
+  if (NODES.length === 0) return;
+  // 지배구조 맵(ego)은 Vis.js hierarchical이 위치를 계산하므로 positions 불필요
+  if (!isEgoMode && Object.keys(positions).length === 0) {
     console.warn("renderGraph: positions not initialized yet");
     return;
   }
@@ -2374,7 +2803,7 @@ function setupZoomControls() {
     zoomInBtn.onclick = () => {
       if (visNetwork) {
         try {
-          const scale = visNetwork.getScale();
+          const scale = getScaleSafe(visNetwork);
           visNetwork.moveTo({ scale: Math.min(3, scale * 1.2) });
         } catch (e) {
           console.warn("Zoom in failed:", e);
@@ -2389,7 +2818,7 @@ function setupZoomControls() {
     zoomOutBtn.onclick = () => {
       if (visNetwork) {
         try {
-          const scale = visNetwork.getScale();
+          const scale = getScaleSafe(visNetwork);
           visNetwork.moveTo({ scale: Math.max(0.3, scale * 0.85) });
         } catch (e) {
           console.warn("Zoom out failed:", e);
@@ -2423,24 +2852,26 @@ function setupZoomControls() {
         resetToHome();
         return;
       }
+      // QA: 비-ego 시 재렌더 없이 선택 해제·뷰 fit만 적용 — 초기화 클릭 후 밀집 재현 방지
       selectedNode = null;
       selectedNodeId = null;
       connectedNodeIds.clear();
       if (visNetwork) {
         try {
           visNetwork.unselectAll();
+          clearSelectionVisualState(visNetwork);
           visNetwork.fit({ animation: { duration: 300 } });
         } catch (e) {
           console.warn("Reset view failed:", e);
         }
       }
-      renderGraph();
-      showEmptyPanel();
+      showEmptyPanel(true);
+      updateStatus("전체 그래프로 늘어났습니다", true);
     };
   }
 }
 
-// CTO: Ego 그래프 에러 재시도 이벤트 위임 (인라인 이벤트 핸들러 제거)
+// Ego 그래프 에러 재시도: 이벤트 위임으로 한 곳에서만 처리 (중복 리스너 방지)
 document.addEventListener("click", (e) => {
   if (e.target.classList.contains("btn-retry") && e.target.dataset.action === "retry-ego-graph") {
     const nodeId = e.target.dataset.nodeId;
@@ -2451,18 +2882,7 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// CTO: Ego 그래프 에러 재시도 이벤트 위임 (인라인 이벤트 핸들러 제거)
-document.addEventListener("click", (e) => {
-  if (e.target.classList.contains("btn-retry") && e.target.dataset.action === "retry-ego-graph") {
-    const nodeId = e.target.dataset.nodeId;
-    if (nodeId) {
-      e.preventDefault();
-      loadEgoGraph(nodeId);
-    }
-  }
-});
-
-// CTO: 초기화 시 줌 컨트롤 설정 (DOM 로드 후)
+// 초기화 시 줌 컨트롤 설정 (DOM 로드 후)
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", setupZoomControls);
 } else {
@@ -2523,9 +2943,12 @@ function focusOnNode(nodeId) {
 
 async function selectNode(n) {
   selectedNode = n;
-  selectedNodeId = n.id; // CTO: UX 패턴 - 선택된 노드 ID 저장
+  selectedNodeId = n.id;
+  lastNodeSelectionTime = Date.now();
 
-  // CTO: 연결된 노드 ID 수집 (dimming 효과용)
+  // CTO: 다른 노드 클릭 시 항상 '노드 상세' 탭으로 전환 — AI 질문 탭에 있을 때도 상세가 바로 보이도록
+  switchTabById("detail");
+
   if (visNetwork) {
     connectedNodeIds.clear();
     try {
@@ -2533,8 +2956,8 @@ async function selectNode(n) {
       connectedEdges.forEach((edgeId) => {
         const edge = visNetwork.body.data.edges.get(edgeId);
         if (edge) {
-          if (edge.from === n.id) connectedNodeIds.add(edge.to);
-          if (edge.to === n.id) connectedNodeIds.add(edge.from);
+          if (nodeIdsEqual(edge.from, n.id)) connectedNodeIds.add(String(edge.to));
+          if (nodeIdsEqual(edge.to, n.id)) connectedNodeIds.add(String(edge.from));
         }
       });
     } catch (e) {
@@ -2542,13 +2965,29 @@ async function selectNode(n) {
     }
   }
 
-  renderGraph();
-  const detail = await loadNodeDetail(n.id);
-  if (detail) {
-    renderNodeDetail(detail);
-  } else {
-    renderNodeDetailFallback(n);
-  }
+  // 즉시 패널 표시(폴백): 클릭 직후 기본 정보로 체감 지연 제거
+  renderNodeDetailFallback(n);
+
+  const requestedNodeId = n.id;
+  const detailPromise = loadNodeDetail(n.id);
+  requestAnimationFrame(() => {
+    renderGraph();
+    // CTO: renderGraph 직후 포커스 — 노드 포커스 안 됨·화면 유동적 이슈 방지 (physics 유지 후 뷰 이동)
+    setTimeout(() => focusOnNode(n.id), 60);
+  });
+  const detail = await detailPromise;
+  // QA/CTO: 노드 클릭 → 드래그(패닝) → 다른 노드 클릭 시 이전 노드 상세가 늦게 도착해 패널 덮어쓰는 것 방지
+  if (detail && nodeIdsEqual(selectedNodeId, requestedNodeId)) renderNodeDetail(detail);
+  else if (!detail) updateNodeDetailLoadingMessage(LOADING_MESSAGES.nodeDetailLoadError);
+}
+
+// CTO: 진행도 메시지 갱신 — 백엔드 진행 이벤트 추가 시 여기만 확장 (확장성·유지보수)
+function updateNodeDetailLoadingMessage(message) {
+  const el = document.getElementById("nodeDetailLoadingHint");
+  if (!el) return;
+  const isError = message === LOADING_MESSAGES.nodeDetailLoadError;
+  el.textContent = message;
+  el.setAttribute("aria-busy", isError ? "false" : "true");
 }
 
 function renderNodeDetailFallback(n) {
@@ -2556,35 +2995,35 @@ function renderNodeDetailFallback(n) {
   const detail = document.getElementById("nodeDetail");
   detail.classList.add("visible");
   const color = getNodeColor(n);
-  const badge = {
-    company: "회사",
-    person: "개인주주",
-    major: "최대주주",
-    institution: "기관",
-  }[n.type];
+  const badge = UI_STRINGS.nodeType[n.type] || n.type;
+  const loadingMsg = LOADING_MESSAGES.nodeDetailLoading;
   detail.innerHTML = `
-    <div class="nd-header">
-      <div class="nd-type-row">
-        <span class="nd-type-badge" style="background:${color}18;color:${color};border:1px solid ${color}30;">
-          ${badge}
-        </span>
+    <div class="nd-body">
+      <div class="nd-header">
+        <div class="nd-type-row">
+          <span class="nd-type-badge" style="background:${color}18;color:${color};border:1px solid ${color}30;">
+            ${badge}
+          </span>
+        </div>
+        <div class="nd-name">${esc(n.label)}</div>
+        <div class="nd-sub">${esc(n.sub || "")}</div>
       </div>
-      <div class="nd-name">${esc(n.label)}</div>
-      <div class="nd-sub">${esc(n.sub || "")}</div>
+      <p class="nd-loading-hint" id="nodeDetailLoadingHint" aria-live="polite" aria-busy="true">
+        <span class="nd-loading-spinner" aria-hidden="true"></span>${esc(loadingMsg)}
+      </p>
     </div>
   `;
 
-  // UX: 액션 버튼을 별도 컨테이너에 추가 (하단 고정용)
   const actionContainer = document.createElement("div");
   actionContainer.className = "nd-actions";
   actionContainer.innerHTML = `
     <button class="ego-map-btn anim" onclick="loadEgoGraph('${n.id}')">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/></svg>
-      이 노드 기준 지배구조 맵 보기
+      ${esc(UI_STRINGS.nodeDetail.btnEgoMap)}
     </button>
     <button class="ask-context-btn anim" onclick="openChatWithContext('${n.id}', '${esc(n.label)}', '${n.type}')">
       <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 10V3a1 1 0 011-1h7a1 1 0 011 1v5a1 1 0 01-1 1H4L2 10z" stroke="white" stroke-width="1.3" stroke-linejoin="round"/></svg>
-      이 노드에 대해 AI에게 질문하기
+      ${esc(UI_STRINGS.nodeDetail.btnAskAi)}
     </button>
   `;
   detail.appendChild(actionContainer);
@@ -2596,23 +3035,19 @@ async function renderNodeDetail(data) {
   detail.classList.add("visible");
 
   const color = getNodeColor(data);
-  const badge = {
-    company: "회사",
-    person: "개인주주",
-    major: "최대주주",
-    institution: "기관",
-  }[data.type];
+  const badge = UI_STRINGS.nodeType[data.type] || data.type;
 
   detail.innerHTML = `
-    <div class="nd-header">
-      <div class="nd-type-row">
-        <span class="nd-type-badge" style="background:${color}18;color:${color};border:1px solid ${color}30;">
-          ${badge}
-        </span>
+    <div class="nd-body">
+      <div class="nd-header">
+        <div class="nd-type-row">
+          <span class="nd-type-badge" style="background:${color}18;color:${color};border:1px solid ${color}30;">
+            ${badge}
+          </span>
+        </div>
+        <div class="nd-name">${esc(data.label)}</div>
+        <div class="nd-sub">${esc(data.sub || "")}</div>
       </div>
-      <div class="nd-name">${esc(data.label)}</div>
-      <div class="nd-sub">${esc(data.sub || "")}</div>
-    </div>
 
     ${
       data.stats && data.stats.length > 0
@@ -2637,13 +3072,16 @@ async function renderNodeDetail(data) {
       data.related && data.related.length > 0
         ? `
     <div class="nd-section">
-      <div class="nd-section-title">연결 노드 (${data.related.length})</div>
+      <div class="nd-section-title">
+        ${UI_STRINGS.nodeDetail.sectionRelated} (${data.related.length})
+        ${data.related.length >= NODE_DETAIL_RELATED_MAX ? `<span class="nd-limit-hint" title="API 기준 최대 ${NODE_DETAIL_RELATED_MAX}개까지 표시">· 최대 ${NODE_DETAIL_RELATED_MAX}개</span>` : ""}
+      </div>
       <div class="related-list" id="relatedList">
         ${data.related
           .slice(0, 3)
           .map(
             (r) => `
-          <div class="related-item" onclick="selectNodeById('${r.id}')">
+          <div class="related-item" onclick="selectNodeById('${String(r.id).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')">
             <div class="ri-dot" style="background:${getNodeColor(r) || "#ccc"}"></div>
             <div class="ri-name">${esc(r.label)}</div>
             ${formatRatio(r.ratio) !== "" ? `<span class="ri-val">${formatRatio(r.ratio)}%</span>` : ""}
@@ -2659,7 +3097,7 @@ async function renderNodeDetail(data) {
               .slice(3)
               .map(
                 (r) => `
-              <div class="related-item" onclick="selectNodeById('${r.id}')">
+              <div class="related-item" onclick="selectNodeById('${String(r.id).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')">
                 <div class="ri-dot" style="background:${getNodeColor(r) || "#ccc"}"></div>
                 <div class="ri-name">${esc(r.label)}</div>
                 ${formatRatio(r.ratio) !== "" ? `<span class="ri-val">${formatRatio(r.ratio)}%</span>` : ""}
@@ -2672,7 +3110,7 @@ async function renderNodeDetail(data) {
             data.related.length - 3 > 0
               ? `
             <button class="related-more-btn" onclick="toggleRelatedMore()">
-              <span class="related-more-text">더보기</span>
+              <span class="related-more-text">${UI_STRINGS.nodeDetail.more}</span>
               <span class="related-more-count">(${data.related.length - 3}개)</span>
               <svg class="related-more-icon" width="10" height="10" viewBox="0 0 10 10" fill="none">
                 <path d="M3 3l2 2 2-2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -2694,7 +3132,7 @@ async function renderNodeDetail(data) {
       data.props && Object.keys(data.props).length > 0
         ? `
     <div class="nd-section">
-      <div class="nd-section-title">속성</div>
+      <div class="nd-section-title">${UI_STRINGS.nodeDetail.sectionAttrs}</div>
       <div class="props-grid">
         ${(() => {
           // CTO: 노드 타입별 속성 필터링 및 중복 제거
@@ -2790,26 +3228,27 @@ async function renderNodeDetail(data) {
     `
         : ""
     }
+    </div>
   `;
 
-  // UX: 액션 버튼을 별도 컨테이너에 추가 (하단 고정용)
+  // UX: 액션 버튼을 nd-body 밖에 두어 패널 하단 고정 (레이아웃 시프트 방지)
   const actionContainer = document.createElement("div");
   actionContainer.className = "nd-actions";
   actionContainer.innerHTML = `
     <button class="ego-map-btn anim" onclick="loadEgoGraph('${data.id}')">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/></svg>
-      이 노드 기준 지배구조 맵 보기
+      ${esc(UI_STRINGS.nodeDetail.btnEgoMap)}
     </button>
     <button class="ask-context-btn anim" onclick="openChatWithContext('${data.id}', '${esc(data.label)}', '${data.type}')">
       <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 10V3a1 1 0 011-1h7a1 1 0 011 1v5a1 1 0 01-1 1H4L2 10z" stroke="white" stroke-width="1.3" stroke-linejoin="round"/></svg>
-      이 노드에 대해 AI에게 질문하기
+      ${esc(UI_STRINGS.nodeDetail.btnAskAi)}
     </button>
   `;
   detail.appendChild(actionContainer);
 }
 
 function selectNodeById(id) {
-  const n = NODES.find((x) => x.id === id);
+  const n = NODES.find((x) => nodeIdsEqual(x.id, id));
   if (n) selectNode(n);
 }
 
@@ -2827,7 +3266,7 @@ function toggleRelatedMore() {
 
   if (moreEl.classList.contains("hidden")) {
     moreEl.classList.remove("hidden");
-    if (textEl) textEl.textContent = "접기";
+    if (textEl) textEl.textContent = UI_STRINGS.nodeDetail.fold;
     if (countEl) countEl.style.display = "none";
     if (iconEl) {
       iconEl.style.transform = "rotate(180deg)";
@@ -2835,7 +3274,7 @@ function toggleRelatedMore() {
   } else {
     moreEl.classList.add("hidden");
     const count = parseInt(countEl?.textContent.match(/\d+/)?.[0] || "0");
-    if (textEl) textEl.textContent = "더보기";
+    if (textEl) textEl.textContent = UI_STRINGS.nodeDetail.more;
     if (countEl) {
       countEl.textContent = `(${count}개)`;
       countEl.style.display = "inline";
@@ -2846,7 +3285,11 @@ function toggleRelatedMore() {
   }
 }
 
-function showEmptyPanel() {
+/**
+ * 노드 상세 패널을 비우고 빈 상태 메시지를 표시.
+ * @param {boolean} [skipRenderGraph=false] - true면 renderGraph() 호출 생략 (빈 공간 클릭 등 레이아웃 유지 시)
+ */
+function showEmptyPanel(skipRenderGraph = false) {
   document.getElementById("panelEmpty").style.display = "";
   document.getElementById("nodeDetail").classList.remove("visible");
   document.getElementById("nodeDetail").innerHTML = "";
@@ -2855,7 +3298,7 @@ function showEmptyPanel() {
   connectedNodeIds.clear();
   if (visNetwork) {
     visNetwork.unselectAll();
-    renderGraph();
+    if (!skipRenderGraph) renderGraph();
   }
 }
 
@@ -2864,15 +3307,25 @@ function showEmptyPanel() {
 ═══════════════════════════════════════════ */
 // UX: AI 질문 탭 기본 프롬프트/제안 (노드 미선택 시) — 일관성·유지보수용 단일 소스
 const CHAT_DEFAULT_PLACEHOLDER = "자연어로 질문하세요 (예: 지분율 50% 이상 최대주주)";
+// CTO: 컨텍스트 있을 때 문구 단일 소스 — 중복 제거·확장성
+const CHAT_CONTEXT_PLACEHOLDER_TEMPLATE = (label) => `"${label}"에 대해 질문하세요...`;
+const CHAT_CONTEXT_SUG_HEADER = "다음 질문을 선택하세요";
+const CHAT_CONTEXT_SWITCHED_TEMPLATE = (label) => `컨텍스트가 ${label}로 변경되었습니다. 아래 대화는 이전 노드 기준일 수 있습니다.`;
+
+// CTO: AI 질문 예시 단일 소스 — 확장·유지보수·협업 (배열만 수정하면 HTML/렌더 동기화)
+const CHAT_DEFAULT_SUGGESTIONS = [
+  { q: "지분율 50% 이상인 최대주주 목록을 보여줘", label: "지분율 50% 이상 최대주주 목록" },
+  { q: "우선주 보유 비중이 높은 회사 TOP 10을 보여줘", label: "우선주 보유 비중이 높은 회사 TOP 10" },
+  { q: "2022년 등기임원 평균보수가 가장 높은 회사 TOP 5", label: "임원보수 TOP 5 (2022년)" },
+  { q: "3개 이상 법인에 투자한 주주를 찾아줘", label: "다중 법인 투자 주주" },
+];
+
 const CHAT_DEFAULT_SUG_HTML = `
   <div style="font-size:12px;color:var(--text-3);margin-bottom:10px;">
     노드를 선택하거나 아래 질문을 눌러보세요
   </div>
   <div class="suggestions" id="globalSugs">
-    <button class="sug-item" data-q="지분율 50% 이상인 최대주주 목록을 보여줘">지분율 50% 이상 최대주주 목록</button>
-    <button class="sug-item" data-q="국민연금이 5% 이상 보유한 회사는 어디야?">국민연금 5% 이상 보유 회사</button>
-    <button class="sug-item" data-q="2022년 등기임원 평균보수가 가장 높은 회사 TOP 5">임원보수 TOP 5 (2022년)</button>
-    <button class="sug-item" data-q="3개 이상 법인에 투자한 주주를 찾아줘">다중 법인 투자 주주</button>
+    ${CHAT_DEFAULT_SUGGESTIONS.map((s) => `<button class="sug-item" data-q="${esc(s.q)}">${esc(s.label)}</button>`).join("\n    ")}
   </div>
 `;
 
@@ -2909,6 +3362,7 @@ function syncChatTabUI() {
 
   if (!chatContext) {
     ctxBar.classList.add("util-hidden");
+    ctxBar.removeAttribute("aria-label");
     chatInput.placeholder = CHAT_DEFAULT_PLACEHOLDER;
     if (sugState) {
       sugState.innerHTML = CHAT_DEFAULT_SUG_HTML;
@@ -2919,13 +3373,12 @@ function syncChatTabUI() {
   }
   ctxBar.classList.remove("util-hidden");
   if (ctxChip) ctxChip.textContent = chatContext.label;
-  chatInput.placeholder = `"${chatContext.label}"에 대해 질문하세요...`;
+  ctxBar.setAttribute("aria-label", `현재 질문 컨텍스트: ${chatContext.label}`);
+  chatInput.placeholder = CHAT_CONTEXT_PLACEHOLDER_TEMPLATE(chatContext.label);
   const sugs = CONTEXT_SUGGESTIONS[chatContext.type]?.({ label: chatContext.label }) || [];
   if (sugState) {
     sugState.innerHTML = `
-      <div style="font-size:12px;color:var(--text-3);margin-bottom:8px;">
-        <strong style="color:var(--pwc-orange)">${esc(chatContext.label)}</strong>에 대해 물어볼 수 있어요
-      </div>
+      <div style="font-size:12px;color:var(--text-3);margin-bottom:8px;">${esc(CHAT_CONTEXT_SUG_HEADER)}</div>
       <div class="suggestions">
         ${sugs.map((q) => `<button class="sug-item" data-q="${esc(q)}">${esc(q)}</button>`).join("")}
       </div>
@@ -2935,10 +3388,27 @@ function syncChatTabUI() {
   }
 }
 
+// CTO: 컨텍스트 전환 시 시스템 메시지로 혼동 방지 (S4), 단일 진입점으로 확장·협업 유지
 function openChatWithContext(nodeId, label, type) {
+  const wasDifferentContext = chatContext && chatContext.nodeId !== nodeId;
+  const previousLabel = chatContext?.label;
+
   switchTabById("chat");
   chatContext = { nodeId, label, type };
   syncChatTabUI();
+
+  if (wasDifferentContext && previousLabel) {
+    const msgs = document.getElementById("chatMsgs");
+    if (msgs) {
+      const sysText = CHAT_CONTEXT_SWITCHED_TEMPLATE(label);
+      const sysEl = document.createElement("div");
+      sysEl.className = "msg system anim";
+      sysEl.setAttribute("role", "status");
+      sysEl.innerHTML = `<div class="msg-bubble">${esc(sysText)}</div>`;
+      msgs.appendChild(sysEl);
+      msgs.scrollTop = msgs.scrollHeight;
+    }
+  }
 }
 
 function clearContext() {
@@ -3060,8 +3530,8 @@ async function sendMessage(q) {
           : "추론 (환각 주의)";
     const srcIcon = data.source === "LLM" ? "⚠️ " : "● ";
 
-    // AI 응답 추가 (한 번만)
-    const answerText = esc(data.answer || "답변을 생성하지 못했습니다.");
+    // AI 응답 추가 (한 번만). CTO: renderChatAnswer — esc 후 **...** → <strong> 안전 렌더
+    const answerText = renderChatAnswer(data.answer || "답변을 생성하지 못했습니다.");
     msgs.insertAdjacentHTML(
       "beforeend",
       `
@@ -3205,25 +3675,29 @@ function updateFilterCounts() {
     );
     if (countEl) {
       const count = nodeCounts[type] || 0;
-      countEl.textContent = `${count.toLocaleString()} 건`;
+      countEl.textContent = `${count.toLocaleString()}${UI_STRINGS.legend.countSuffix}`;
     }
   });
 }
 
 async function toggleFilter(el) {
-  const f = el.dataset.filter;
+  const pill = el?.closest?.(".filter-pill") || el;
+  const f = pill?.dataset?.filter;
+  if (f == null || !GRAPH_CONFIG.nodeTypes.includes(f)) return;
   if (activeFilters.has(f)) {
     if (activeFilters.size > 1) {
       activeFilters.delete(f);
-      el.classList.remove("active");
+      pill.classList.remove("active");
     }
   } else {
     activeFilters.add(f);
-    el.classList.add("active");
+    pill.classList.add("active");
   }
 
-  // QA: 필터 변경 시 모든 활성 필터 노드 표시 (dimming은 렌더링 시 처리)
-  const visibleNodes = NODES.filter((n) => activeFilters.has(n.type));
+  // QA: 필터 변경 시 모든 활성 필터 노드 표시 (노드 타입 정규화로 API 대소문자 차이 흡수)
+  const visibleNodes = NODES.filter((n) =>
+    activeFilters.has(canonicalNodeType(n.type)),
+  );
   // CTO: 개발 환경에서만 필터 변경 로그 출력
   const isDevelopment =
     window.location.hostname === "localhost" ||
@@ -3238,36 +3712,25 @@ async function toggleFilter(el) {
     });
   }
 
-  // CTO: 타 서비스 패턴 - 필터링 후 physics 재활성화하여 레이아웃 재안정화
-  renderGraph();
-  if (visNetwork) {
-    // 필터링 후 새로운 노드 구성에 맞게 레이아웃 재계산
-    visNetwork.setOptions({ physics: true });
-    physicsEnabledState = true; // 상태 추적 업데이트
-    // 안정화 완료 후 자동으로 physics: false로 전환됨 (stabilizationIterationsDone 이벤트)
-  }
-
   if (visibleNodes.length === 0) {
     console.warn(
       "필터 적용 후 표시할 노드가 없습니다. 모든 필터가 비활성화되었습니다.",
     );
-    updateStatus("최소 하나의 노드 타입을 선택해주세요", false);
+    updateStatus(UI_STRINGS.filter.minOneType, false);
     // 필터를 다시 활성화하여 빈 그래프 방지
     activeFilters.add(f);
-    el.classList.add("active");
+    pill.classList.add("active");
     return;
   }
 
-  // QA: 선택 해제 (필터 변경 시 선택 상태 유지하지 않음)
   selectedNodeId = null;
   connectedNodeIds.clear();
-  if (visNetwork) {
-    visNetwork.unselectAll();
-  }
+  if (visNetwork) visNetwork.unselectAll();
 
-  await initPositions(); // 필터 변경 시 재배치
+  // CTO: 필터 on/off 시 밀집 방지 — physics 재활성화 제거, initPositions 후 1회만 렌더
+  if (!isEgoMode) await initPositions();
   renderGraph();
-  showEmptyPanel(); // 패널 초기화
+  showEmptyPanel(true); // QA: 이중 렌더 방지 (위 renderGraph만 사용)
   if (visNetwork) {
     setTimeout(() => visNetwork.fit({ animation: { duration: 300 } }), 100);
   }
@@ -3279,31 +3742,76 @@ async function toggleFilter(el) {
 let searchTimeout = null;
 let searchResults = [];
 let selectedSearchIndex = -1;
+// CTO: 지배구조 맵(ego) 시 검색 결과가 서버 API 기준이면 true — 클릭 시 해당 노드 ego로 전환
+let searchResultsFromApi = false;
+
+const SEARCH_SUGGESTION_LIMIT = 10;
+const SEARCH_API_LIMIT = 15;
+
+// CTO: 서버 검색 단일 진입점 — 홈/지배구조 맵(ego) 공통, 확장성·유지보수
+function searchViaApi(q) {
+  searchResultsFromApi = true;
+  showSearchLoading();
+  apiCall(
+    `/api/v1/graph/nodes?search=${encodeURIComponent(q)}&limit=${SEARCH_API_LIMIT}`,
+  )
+    .then((res) => {
+      const nodes = (res?.nodes || []).slice(0, SEARCH_SUGGESTION_LIMIT);
+      searchResults = nodes;
+      if (nodes.length === 0) {
+        showSearchNoResults();
+      } else {
+        showSearchResults(nodes, q.toLowerCase(), true);
+      }
+    })
+    .catch(() => {
+      searchResultsFromApi = false;
+      showSearchNoResults();
+    });
+}
 
 function performSearch(query) {
   if (!query || query.trim().length === 0) {
+    searchResultsFromApi = false;
     clearSearchHighlight();
     hideSearchResults();
     renderGraph();
     return;
   }
 
-  const q = query.toLowerCase().trim();
-  searchResults = NODES.filter(
-    (n) =>
-      n.label.toLowerCase().includes(q) ||
-      (n.sub && n.sub.toLowerCase().includes(q)),
-  ).slice(0, 10);
-
+  const q = query.trim();
   selectedSearchIndex = -1;
+  const qLower = q.toLowerCase();
 
-  if (searchResults.length === 0) {
-    showSearchNoResults();
-    clearSearchHighlight();
-  } else {
-    showSearchResults(searchResults, q);
-    highlightSearchResults(searchResults);
+  // CTO: 지배구조 맵(ego) 또는 홈에서 로컬 데이터 없음/매칭 없음 → 서버 검색 (홈/노드 클릭 시 검색 안 되는 이슈 대응)
+  const useApiOnly = isEgoMode;
+  const noLocalData = NODES.length === 0;
+  const localResults = noLocalData
+    ? []
+    : NODES.filter(
+        (n) =>
+          n.label.toLowerCase().includes(qLower) ||
+          (n.sub && n.sub.toLowerCase().includes(qLower)),
+      ).slice(0, SEARCH_SUGGESTION_LIMIT);
+
+  if (useApiOnly || noLocalData || localResults.length === 0) {
+    searchViaApi(q);
+    return;
   }
+
+  searchResultsFromApi = false;
+  searchResults = localResults;
+  showSearchResults(localResults, qLower, false);
+  highlightSearchResults(localResults);
+}
+
+function showSearchLoading() {
+  const resultsEl = document.getElementById("searchResults");
+  if (!resultsEl) return;
+  resultsEl.innerHTML = `
+    <div class="search-no-results" style="color:var(--text-3);">검색 중...</div>
+  `;
+  resultsEl.classList.remove("hidden");
 }
 
 function highlightSearchResults(results) {
@@ -3334,24 +3842,20 @@ function highlightMatch(text, query) {
   );
 }
 
-function showSearchResults(results, query) {
+function showSearchResults(results, query, fromApi = false) {
   const resultsEl = document.getElementById("searchResults");
   if (!resultsEl) return;
 
+  const typeLabels = UI_STRINGS.nodeType;
   resultsEl.innerHTML = results
     .map((node, idx) => {
-      const label = highlightMatch(node.label, query);
-      const typeLabel =
-        {
-          company: "회사",
-          person: "개인주주",
-          major: "최대주주",
-          institution: "기관",
-        }[node.type] || node.type;
+      const label = highlightMatch(node.label || "", query);
+      const typeLabel = typeLabels[node.type] || node.type || "";
       return `
       <div class="search-result-item ${idx === selectedSearchIndex ? "selected" : ""}" 
-           data-node-id="${node.id}" 
-           data-index="${idx}">
+           data-node-id="${esc(node.id)}" 
+           data-index="${idx}"
+           data-from-api="${fromApi ? "1" : "0"}">
         <div class="search-result-label">${label}</div>
         <div class="search-result-type">${typeLabel}</div>
       </div>
@@ -3361,15 +3865,22 @@ function showSearchResults(results, query) {
 
   resultsEl.classList.remove("hidden");
 
-  // 클릭 이벤트
   resultsEl.querySelectorAll(".search-result-item").forEach((item) => {
     item.addEventListener("click", () => {
       const nodeId = item.dataset.nodeId;
-      const node = NODES.find((n) => n.id === nodeId);
+      const fromApiClick = item.dataset.fromApi === "1";
+      if (fromApiClick) {
+        loadEgoGraph(nodeId).then(() => {
+          hideSearchResults();
+          const searchInput = document.getElementById("nodeSearch");
+          if (searchInput) searchInput.value = "";
+        });
+        searchResultsFromApi = false;
+        return;
+      }
+      const node = NODES.find((n) => nodeIdsEqual(n.id, nodeId));
       if (node) {
-        selectNode(node);
-        renderGraph();
-        focusOnNode(node.id);
+        selectNode(node); // 내부에서 renderGraph + focusOnNode 호출 (일관된 타이밍·라벨 표시)
         hideSearchResults();
         const searchInput = document.getElementById("nodeSearch");
         if (searchInput) searchInput.value = "";
@@ -3439,9 +3950,15 @@ function setupSearch() {
     ) {
       e.preventDefault();
       const node = searchResults[selectedSearchIndex];
-      selectNode(node);
-      renderGraph();
-      focusOnNode(node.id);
+      if (searchResultsFromApi) {
+        loadEgoGraph(node.id).then(() => {
+          hideSearchResults();
+          this.value = "";
+        });
+        searchResultsFromApi = false;
+        return;
+      }
+      selectNode(node); // 내부에서 renderGraph + focusOnNode 호출
       hideSearchResults();
       this.value = "";
     } else if (e.key === "Escape") {
@@ -3467,6 +3984,13 @@ function esc(s) {
   const div = document.createElement("div");
   div.textContent = s;
   return div.innerHTML;
+}
+
+// CTO: AI 답변용 — esc 후 **...** 만 <strong>으로 렌더 (XSS 방지 유지, 확장 시 서브셋 추가 가능)
+function renderChatAnswer(text) {
+  if (text == null || text === "") return "";
+  const escaped = esc(text);
+  return escaped.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
 }
 
 /* ═══════════════════════════════════════════
@@ -3508,7 +4032,7 @@ function resetToHome() {
   if (isEgoMode) {
     isEgoMode = false;
     egoCenterId = null;
-    const banner = document.getElementById("egoBanner");
+    const banner = document.getElementById(GOV_MAP_IDS.banner);
     if (banner) banner.classList.add("util-hidden");
     loadGraph().then(() => {
       if (visNetwork) {
@@ -3532,10 +4056,11 @@ function resetToHome() {
     return;
   }
 
-  renderGraph();
-
-  if (visNetwork) {
+  // CTO: 비-ego 시 저장된 positions로 레이아웃 재적용 후 fit — 로고 클릭 후 밀집 상태 복구 (일관성·확장성)
+  if (visNetwork && NODES.length > 0 && Object.keys(positions).length > 0) {
     visNetwork.unselectAll();
+    clearSelectionVisualState(visNetwork);
+    renderGraph(); // 저장된 레이아웃 재적용 (physics 미재활성화로 밀집 유발 없음)
     let fitDone = false;
     const doFit = () => {
       if (fitDone || !visNetwork) return;
@@ -3548,15 +4073,81 @@ function resetToHome() {
     };
     visNetwork.once("stabilizationIterationsDone", doFit);
     setTimeout(doFit, 550);
+  } else if (visNetwork) {
+    visNetwork.unselectAll();
+    clearSelectionVisualState(visNetwork);
+    try {
+      visNetwork.fit({ animation: { duration: 300 } });
+    } catch (e) {
+      console.warn("resetToHome fit failed:", e);
+    }
   }
 
-  showEmptyPanel();
+  showEmptyPanel(true);
   updateStatus("홈으로 이동했습니다", true);
+}
+
+// CTO: 범례/노드 유형 라벨을 UI_STRINGS와 동기화 (단일 소스, 하드코딩 제거)
+function syncLegendLabels() {
+  const titleEl = document.querySelector(".legend-title");
+  if (titleEl) titleEl.textContent = UI_STRINGS.legend.title;
+  GRAPH_CONFIG.nodeTypes.forEach((type) => {
+    const row = document.querySelector(`.legend-row[data-count-type="${type}"]`);
+    const labelEl = row?.querySelector(".legend-label");
+    if (labelEl) labelEl.textContent = UI_STRINGS.nodeType[type] || type;
+  });
+}
+
+// CTO: 탭·필터·빈 패널·지배구조 맵 버튼 문구를 UI_STRINGS와 동기화 (확장성·유지보수·협업)
+function syncPanelTabLabels() {
+  document.querySelectorAll(".ptab[data-tab]").forEach((el) => {
+    const key = el.getAttribute("data-tab");
+    if (key && UI_STRINGS.tabs[key]) el.textContent = UI_STRINGS.tabs[key];
+  });
+}
+
+function syncFilterLabels() {
+  document.querySelectorAll(".filter-pill[data-filter]").forEach((el) => {
+    const key = el.getAttribute("data-filter");
+    const labelEl = el.querySelector(".filter-label");
+    if (labelEl && key) labelEl.textContent = UI_STRINGS.nodeType[key] || key;
+  });
+}
+
+function syncPanelEmptyLabels() {
+  const wrap = document.getElementById("panelEmpty");
+  if (!wrap) return;
+  const p = wrap.querySelector("p");
+  const span = wrap.querySelector("span");
+  const s = UI_STRINGS.panelEmpty;
+  if (p) p.innerHTML = `${esc(s.title)}<br/>${esc(s.titleBr)}`;
+  if (span) span.textContent = s.hint;
+}
+
+function syncEgoBannerButtonLabels() {
+  const egoBtn = document.getElementById(GOV_MAP_IDS.btnEgo);
+  const exitBtn = document.querySelector(".ego-exit-btn");
+  const heatBtn = document.getElementById(GOV_MAP_IDS.btnHeatmap);
+  const labelEl = document.getElementById(GOV_MAP_IDS.bannerLabel);
+  if (egoBtn) egoBtn.textContent = UI_STRINGS.govMap.btnEgo;
+  if (exitBtn) exitBtn.textContent = UI_STRINGS.govMap.btnExit;
+  if (heatBtn) heatBtn.textContent = UI_STRINGS.govMap.btnHeatmap;
+  if (labelEl) labelEl.textContent = UI_STRINGS.govMap.label;
+}
+
+// CTO: 모든 UI 문구를 UI_STRINGS와 동기화 (탭·필터·범례·빈 패널·지배구조 맵)
+function syncAllUILabels() {
+  syncLegendLabels();
+  syncPanelTabLabels();
+  syncFilterLabels();
+  syncPanelEmptyLabels();
+  syncEgoBannerButtonLabels();
 }
 
 // CTO: Vis.js 라이브러리 로드 확인 후 loadGraph 실행 (초기화)
 function waitForVisJs(maxAttempts = 20, interval = 100) {
   if (typeof vis !== "undefined" && vis.Network) {
+    syncAllUILabels();
     loadGraph();
     // UX: 검색 및 로고 이벤트 설정
     setupSearch();
@@ -3570,7 +4161,7 @@ function waitForVisJs(maxAttempts = 20, interval = 100) {
       false,
     );
     hideGraphLoading();
-    // Vis.js 실패해도 검색/로고는 설정
+    syncAllUILabels();
     setupSearch();
     setupLogoHome();
     return;

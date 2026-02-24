@@ -4,7 +4,9 @@
 """
 import logging
 import re
-from typing import Optional
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from neo4j.exceptions import ServiceUnavailable, TransientError, ClientError
@@ -17,6 +19,11 @@ from app.services import layout_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/graph", tags=["graph"])
+
+# 노드 상세 응답 캐시 (TTL). 협업: 동일 노드 재클릭 시 백엔드 부하 감소
+_NODE_DETAIL_CACHE: dict[str, tuple[float, Any]] = {}
+NODE_DETAIL_CACHE_TTL_SEC = 60
+_node_detail_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="node_detail")
 
 
 _ID_RE = re.compile(r"(\d+)$")
@@ -416,20 +423,25 @@ def post_layout(body: LayoutRequest):
 def get_node_detail(node_id: str):
     """
     특정 노드의 상세 정보 + 연결된 노드 목록.
+    성능: 캐시(TTL 60초) + 관련/통계 쿼리 병렬 실행으로 체감 지연 감소.
     """
     graph = graph_service.get_graph()
     neo4j_id = _neo4j_id(node_id)
-    
-    # 노드 기본 정보
+    cache_key = node_id
+
+    # 캐시 적중 시 즉시 반환 (동일 노드 재클릭 체감 개선)
+    now = time.monotonic()
+    if cache_key in _NODE_DETAIL_CACHE:
+        expiry, payload = _NODE_DETAIL_CACHE[cache_key]
+        if now < expiry:
+            return payload
+        del _NODE_DETAIL_CACHE[cache_key]
+
     node_query = """
         MATCH (n)
         WHERE id(n) = $id
-        RETURN 
-            labels(n) AS labels,
-            properties(n) AS props
+        RETURN labels(n) AS labels, properties(n) AS props
     """
-    
-    # 연결된 노드 (HOLDS_SHARES 관계) — 노드(m)당 한 행만 반환, ratio는 max로
     related_query = """
         MATCH (n)-[r:HOLDS_SHARES]-(m)
         WHERE id(n) = $id
@@ -438,17 +450,26 @@ def get_node_detail(node_id: str):
         ORDER BY ratio DESC
         LIMIT 20
     """
-    
+    max_ratio_query = """
+        MATCH (n:Company)<-[r:HOLDS_SHARES]-(s)
+        WHERE id(n) = $id
+        WITH DISTINCT s, max(r.stockRatio) AS maxRatio
+        RETURN max(maxRatio) AS maxRatio, count(s) AS holderCount
+    """
+    holdings_query = """
+        MATCH (n)-[r:HOLDS_SHARES]->(c:Company)
+        WHERE id(n) = $id
+        RETURN count(c) AS holdings, avg(r.stockRatio) AS avgRatio
+    """
+
     try:
         node_rows = graph.query(node_query, params={"id": neo4j_id})
         if not node_rows:
             raise HTTPException(404, "노드를 찾을 수 없습니다.")
-        
+
         node_row = node_rows[0]
         labels = node_row.get("labels", [])
         props = node_row.get("props", {})
-        
-        # 노드 타입 판단 (labels + shareholderType)
         shareholder_type = (props.get("shareholderType") or "PERSON").upper()
         is_company = "Company" in labels
         is_major = "MajorShareholder" in labels
@@ -458,9 +479,19 @@ def get_node_detail(node_id: str):
             node_type = "company"
         else:
             node_type = "institution" if shareholder_type != "PERSON" else "person"
-        
-        # 연결 노드
-        related_rows = graph.query(related_query, params={"id": neo4j_id})
+
+        # 관련 노드 + 통계 쿼리 병렬 실행 (체감 지연 감소)
+        params_id = {"id": neo4j_id}
+        stat_query = max_ratio_query if node_type == "company" else holdings_query
+        future_related = _node_detail_executor.submit(
+            lambda: graph.query(related_query, params=params_id)
+        )
+        future_stats = _node_detail_executor.submit(
+            lambda: graph.query(stat_query, params=params_id)
+        )
+        related_rows = future_related.result()
+        stat_rows = future_stats.result()
+
         related = [
             {
                 "id": f"n{r['id']}",
@@ -473,44 +504,23 @@ def get_node_detail(node_id: str):
             }
             for r in related_rows
         ]
-        
-        # 통계
         stats = []
-        if node_type == "company":
-            # CTO: 그래프 DB 전문가 관점 - 고유 노드 수 계산
-            # 문제: count(r)는 관계 개수를 세어 중복 관계가 있을 경우 부정확함
-            # 해결: DISTINCT s를 사용하여 고유한 주주 노드만 카운트
-            # 일관성: 연결 노드 계산과 동일한 기준 사용 (WITH m)
-            max_ratio_query = """
-                MATCH (n:Company)<-[r:HOLDS_SHARES]-(s)
-                WHERE id(n) = $id
-                WITH DISTINCT s, max(r.stockRatio) AS maxRatio
-                RETURN max(maxRatio) AS maxRatio, count(s) AS holderCount
-            """
-            stat_rows = graph.query(max_ratio_query, params={"id": neo4j_id})
-            if stat_rows:
-                max_ratio = _clamp_ratio(stat_rows[0].get("maxRatio"))
-                holder_count = stat_rows[0].get("holderCount") or 0
-                stats = [
-                    {"val": f"{float(max_ratio):.1f}%", "key": "최대주주 지분율"},
-                    {"val": str(int(holder_count)), "key": "고유 노드 수"},
-                ]
-        else:
-            holdings_query = """
-                MATCH (n)-[r:HOLDS_SHARES]->(c:Company)
-                WHERE id(n) = $id
-                RETURN count(c) AS holdings, avg(r.stockRatio) AS avgRatio
-            """
-            stat_rows = graph.query(holdings_query, params={"id": neo4j_id})
-            if stat_rows:
-                holdings = stat_rows[0].get("holdings") or 0
-                avg_ratio = _clamp_ratio(stat_rows[0].get("avgRatio"))
-                stats = [
-                    {"val": str(int(holdings)), "key": "투자 종목수"},
-                    {"val": f"{float(avg_ratio):.1f}%", "key": "평균 지분율"},
-                ]
-        
-        return {
+        if node_type == "company" and stat_rows:
+            max_ratio = _clamp_ratio(stat_rows[0].get("maxRatio"))
+            holder_count = stat_rows[0].get("holderCount") or 0
+            stats = [
+                {"val": f"{float(max_ratio):.1f}%", "key": "최대주주 지분율"},
+                {"val": str(int(holder_count)), "key": "고유 노드 수"},
+            ]
+        elif node_type != "company" and stat_rows:
+            holdings = stat_rows[0].get("holdings") or 0
+            avg_ratio = _clamp_ratio(stat_rows[0].get("avgRatio"))
+            stats = [
+                {"val": str(int(holdings)), "key": "투자 종목수"},
+                {"val": f"{float(avg_ratio):.1f}%", "key": "평균 지분율"},
+            ]
+
+        result = {
             "id": f"n{neo4j_id}",
             "type": node_type,
             "label": props.get("companyName") or props.get("stockName", "Unknown"),
@@ -518,10 +528,12 @@ def get_node_detail(node_id: str):
             if node_type == "company"
             else ("최대주주" if node_type == "major" else ("기관" if node_type == "institution" else "개인주주")),
             "stats": stats,
-            "props": {k: v for k, v in props.items() if k not in ["nameEmbedding"]},  # 임베딩 제외
+            "props": {k: v for k, v in props.items() if k not in ["nameEmbedding"]},
             "related": related,
         }
-    
+        _NODE_DETAIL_CACHE[cache_key] = (now + NODE_DETAIL_CACHE_TTL_SEC, result)
+        return result
+
     except HTTPException:
         raise
     except ServiceUnavailable:

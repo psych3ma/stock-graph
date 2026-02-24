@@ -12,13 +12,14 @@
 <!-- Vis.js for smooth UX (hybrid: PyGraphviz layout + Vis.js rendering) -->
 <link href="https://unpkg.com/vis-network/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
 <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js" defer></script>
-<!-- P2: API Base 주입 (배포 시 환경변수/빌드 시 주입 가능) -->
+<!-- API Base: 로컬(localhost)이면 미설정 → graph.js가 http://localhost:8000 사용, 배포 시에만 원격 URL 설정 -->
 <script>
-  // window.GRAPHIQ_API_BASE를 여기서 설정하면 graph.js의 API_BASE가 이를 사용 
-  // 이 주소를 본인의 Render 백엔드 주소로 설정합니다.
-  window.GRAPHIQ_API_BASE = 'https://stock-graph-y8v7.onrender.com';
-  // 예: window.GRAPHIQ_API_BASE = 'https://api.example.com';
-  // 배포 시 환경변수로 주입: <script>window.GRAPHIQ_API_BASE = '{{API_BASE}}';</script>
+  (function() {
+    var isLocal = !window.location.hostname || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    if (!isLocal) {
+      window.GRAPHIQ_API_BASE = 'https://stock-graph-y8v7.onrender.com';
+    }
+  })();
 </script>
 </head>
 <body>
@@ -125,8 +126,9 @@
     </div>
 
     <!-- ═════════════════ VIS.JS NETWORK CONTAINER ═════════════════ -->
-    <!-- CTO: 레거시 컨테이너(visNetworkContainer) 완전 제거 완료, 현재 ID: visNetwork -->
     <div id="visNetwork" aria-label="그래프 네트워크" data-drag-sync-bound="1"></div>
+    <!-- 지배구조 맵: 가중치 엣지 히트맵 뷰 (Ego 그래프와 전환 가능) -->
+    <div id="egoHeatmapWrap" class="ego-heatmap-wrap util-hidden" aria-label="가중치 엣지 히트맵"></div>
     
     <!-- ═════════════════ TOOLTIP ═════════════════ -->
     <!-- CTO: ID 변경 (tooltip → graphTooltip), role="tooltip" 추가 -->
@@ -182,7 +184,11 @@
       <div class="ptab" data-tab="chat" onclick="switchTab(this)">AI 질문</div>
     </div>
     <div id="egoBanner" class="ego-banner util-hidden" role="region" aria-label="지배구조 맵">
-      <span class="ego-banner-label">지배구조 맵 (Ego-Graph)</span>
+      <span class="ego-banner-label" id="egoBannerLabel">지배구조 맵</span>
+      <div class="ego-banner-actions">
+        <button type="button" class="ego-view-btn" id="egoViewHeatmapBtn" title="가중치(지분율) 행렬로 보기">히트맵</button>
+        <button type="button" class="ego-view-btn" id="egoViewEgoBtn" title="노드-링크 그래프로 보기">Ego 그래프</button>
+      </div>
       <button type="button" class="ego-exit-btn">전체 그래프로 돌아가기</button>
     </div>
 
@@ -220,7 +226,7 @@
           </div>
           <div class="suggestions" id="globalSugs">
             <button class="sug-item" data-q="지분율 50% 이상인 최대주주 목록을 보여줘">지분율 50% 이상 최대주주 목록</button>
-            <button class="sug-item" data-q="국민연금이 5% 이상 보유한 회사는 어디야?">국민연금 5% 이상 보유 회사</button>
+            <button class="sug-item" data-q="우선주 보유 비중이 높은 회사 TOP 10을 보여줘">우선주 보유 비중이 높은 회사 TOP 10</button>
             <button class="sug-item" data-q="2022년 등기임원 평균보수가 가장 높은 회사 TOP 5">임원보수 TOP 5 (2022년)</button>
             <button class="sug-item" data-q="3개 이상 법인에 투자한 주주를 찾아줘">다중 법인 투자 주주</button>
           </div>

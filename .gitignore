@@ -9,6 +9,10 @@ htmlcov
 data/*
 !data/.gitkeep
 *.png
+!docs/image/*.png
+!docs/image/*.jpg
+!docs/image/*.jpeg
+!docs/image/*.webp
 .DS_Store
 .idea
 *.egg-info

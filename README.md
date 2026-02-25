@@ -206,5 +206,5 @@ OPENAI_API_KEY=sk-...
 ---
 
 <div align="center">
-  <sub>데이터 출처: 금융위원회 금융회사지배구조정보 공시 · Made with FastAPI · Neo4j · Vis.js</sub>
+  <sub>데이터 출처: 금융위원회 금융회사지배구조정보 공시 · Made with Cursor AI</sub>
 </div>

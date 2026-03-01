@@ -12,7 +12,7 @@
 
 ## 🎬 데모
 
-[![데모 영상](docs/image/fnco-graph_thumbnail.png)](https://drive.google.com/drive/folders/1JgG3vykhsO898z7PuJpC2QAV8D4tTeKy)
+[![데모 영상](docs/image/fnco-graph_thumbnail.png)](https://drive.google.com/file/d/1Q5W1IcG8TYZY20RovIJYaoDphFtsW3Le/view?usp=sharing)
 > 이미지 클릭 시 데모 영상으로 이동합니다.
 
 ---
